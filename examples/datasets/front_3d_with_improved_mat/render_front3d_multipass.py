@@ -65,6 +65,7 @@ Usage:
   if omitted - pass your own values to override any of them.
 
 blenderproc run render_front3d_multipass.py --num_camera_poses 4 --num_light_setups 16 --resolution 512
+blenderproc run render_front3d_multipass.py --num_camera_poses 2 --num_light_setups 2 --resolution 124
 
 """
 
