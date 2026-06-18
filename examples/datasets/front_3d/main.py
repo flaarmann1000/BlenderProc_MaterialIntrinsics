@@ -3,6 +3,16 @@ import argparse
 import os
 import numpy as np
 
+"""
+
+blenderproc run main.py ^
+  E:\3D-Front\3D-FRONT\00ad8345-45e0-45b3-867d-4a3c88c2517a.json ^
+  E:\3D-Front\3D-FUTURE-model ^
+  E:\3D-Front\3D-FRONT-texture ^
+  output
+  
+"""
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("front", help="Path to the 3D front file")
