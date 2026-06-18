@@ -4,28 +4,43 @@ import blenderproc as bproc
 render_front3d_multipass.py
 ============================
 
-Renders a 3D-FRONT scene with BlenderProc: N camera views, each rendered
-under M randomly generated lighting conditions (1-3 point/area lights per
-condition, randomized position/color/energy/size), plus a lighting-
-independent G-buffer captured once per view. Output layout:
+Renders a 3D-FRONT scene with BlenderProc: N camera views, each with its own
+lighting-independent G-buffer plus M lighting conditions. For each view,
+every light condition is generated, rendered, and checked: if the resulting
+image's average brightness falls outside [brightness_min, brightness_max]
+(default 0.2-0.8), a new random light condition is generated and re-rendered,
+up to --max_light_retries attempts (after which the last attempt is kept
+anyway, so every view always ends up with exactly M images). This is done
+render-wise rather than pregenerating M lighting conditions for the whole
+scene up front, since the same light setup can be well-exposed from one
+viewpoint and not another. Output layout:
 
   <output_dir>/<scene_id>/
     light_conditions.json
-      Manifest describing the exact parameters (type/location/energy/color/
-      size) of every light in every light_XXX condition, for reproducibility.
+      Manifest of every accepted (or given-up-on) light condition per view:
+      its exact parameters (type/location/energy/color/size per light),
+      the resulting brightness, and how many attempts it took.
     <cam_nr>/                  (one folder per view, cam_nr = 0, 1, 2, ...)
-      albedo.png                - diffuse base color   (lighting-independent)
-      normals.png                - surface normals      (lighting-independent)
-      roughness.png              - 16-bit material roughness (lighting-independent)
+      albedo.png                  - diffuse base color   (lighting-independent)
+      normals.png                 - surface normals      (lighting-independent)
+      roughness.png               - 16-bit material roughness (lighting-independent)
       metallic.png                - 16-bit material metallic  (lighting-independent)
       light_000.png ... light_MMM.png  - beauty render under each lighting condition
 
 scene_id is derived from the input scene .json's filename (without extension).
 
-Albedo/normals/roughness/metallic only depend on geometry and materials, not
-on lighting, so they're rendered once for all views in a single dedicated
-call before the M lighting conditions are rendered, then moved from a flat
-temp folder into their final per-view folders.
+Note: this renders one camera pose at a time (via bproc.utility.
+reset_keyframes() + a single add_camera_pose() per view) rather than
+batching all N views into one render() call per lighting condition, since
+each light condition now needs to be individually checked and possibly
+retried before being accepted. This is slower per image than batched
+rendering, especially if many lighting attempts get rejected.
+
+A view's G-buffer is also checked after rendering it: if the roughness or
+metallic map turns out essentially flat across the whole frame (std below
+--min_material_std, e.g. a close-up of a single material), the camera pose
+is discarded and a fresh one sampled instead, up to --max_view_retries
+attempts (after which the last attempt is kept anyway).
 
 NOTE on file naming: albedo/normals/roughness/metallic are all written
 DIRECTLY to disk by manual compositor "File Output" nodes, bypassing
@@ -34,7 +49,7 @@ color_output / enable_normals_output). This sidesteps a recurring Blender
 issue on this machine where Blender appends an unexpected "_L" view suffix
 to compositor-written filenames, which otherwise makes BlenderProc crash
 with FileNotFoundError when it tries to reload them by their expected name.
-The move-into-view-folders step is tolerant of that suffix (or any other
+The rename-in-place step is tolerant of that suffix (or any other
 unexpected text Blender appends) since it only matches on the leading
 channel name and frame digits.
 
@@ -42,10 +57,15 @@ Usage:
   blenderproc run render_front3d_multipass.py \
       [FRONT_JSON] [FUTURE_MODEL_DIR] [FRONT_TEXTURE_DIR] [OUTPUT_DIR] \
       [--cc_material_path CC_TEXTURES_DIR] [--metal_material_list PATH] \
-      [--num_camera_poses N] [--num_light_setups M] [--seed N] [--resolution N]
+      [--num_camera_poses N] [--num_light_setups M] [--seed N] [--resolution N] \
+      [--brightness_min F] [--brightness_max F] [--max_light_retries N] \
+      [--min_material_std F] [--max_view_retries N]
 
   All positional/optional arguments default to Felix's actual dataset paths
   if omitted - pass your own values to override any of them.
+
+blenderproc run render_front3d_multipass.py --num_camera_poses 4 --num_light_setups 16 --resolution 512
+
 """
 
 import argparse
@@ -103,6 +123,23 @@ parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, defaul
                           "--no-overwrite to keep/merge into an existing folder instead.")
 parser.add_argument("--resolution", type=int, default=124,
                      help="Square render resolution")
+parser.add_argument("--brightness_min", type=float, default=0.2,
+                     help="Minimum acceptable average image brightness (0-1 luminance)")
+parser.add_argument("--brightness_max", type=float, default=0.8,
+                     help="Maximum acceptable average image brightness (0-1 luminance)")
+parser.add_argument("--max_light_retries", type=int, default=15,
+                     help="Max attempts to find a light condition within the brightness range "
+                          "for a given (view, light slot) before giving up and keeping the "
+                          "last attempt anyway")
+parser.add_argument("--min_material_std", type=float, default=0.01,
+                     help="Minimum standard deviation (0-1 normalized) required in BOTH the "
+                          "roughness and metallic G-buffer maps for a view to be kept - a value "
+                          "below this on either map means that map is essentially flat/uniform "
+                          "('boring') across the whole view, e.g. a close-up of a single material.")
+parser.add_argument("--max_view_retries", type=int, default=10,
+                     help="Max attempts to find a camera pose whose G-buffer isn't 'boring' "
+                          "(see --min_material_std) before giving up and keeping the last "
+                          "attempt anyway")
 args = parser.parse_args()
 
 if args.cc_material_path and args.cc_material_path.strip().lower() in ("none", ""):
@@ -211,7 +248,11 @@ if args.cc_material_path:
 mesh_objects = [o for o in loaded_objects if isinstance(o, bproc.types.MeshObject)]
 
 # ---------------------------------------------------------------------------
-# Camera pose sampling (same logic as BlenderProc's official front_3d example)
+# Camera pose sampler (same coverage/obstacle logic as BlenderProc's
+# official front_3d example). Returns one candidate pose at a time rather
+# than collecting all N up front, since a pose can now be rejected *after*
+# rendering its G-buffer (if the material maps turn out too uniform/
+# "boring" - see the per-view loop below) and a fresh pose sampled instead.
 # ---------------------------------------------------------------------------
 bproc.camera.set_resolution(args.resolution, args.resolution)
 
@@ -219,22 +260,19 @@ point_sampler = bproc.sampler.Front3DPointInRoomSampler(loaded_objects)
 bvh_tree = bproc.object.create_bvh_tree_multi_objects(mesh_objects)
 
 proximity_checks = {"min": 1.0, "avg": {"min": 2.5, "max": 3.5}, "no_background": True}
-poses, tries = 0, 0
-while poses < args.num_camera_poses and tries < 10000:
-    tries += 1
-    height = np.random.uniform(1.4, 1.8)
-    location = point_sampler.sample(height)
-    rotation = np.random.uniform([1.2217, 0, 0], [1.338, 0, 2 * np.pi])
-    cam2world_matrix = bproc.math.build_transformation_mat(location, rotation)
 
-    if bproc.camera.scene_coverage_score(cam2world_matrix) > 0.4 \
-            and bproc.camera.perform_obstacle_in_view_check(cam2world_matrix, proximity_checks, bvh_tree):
-        bproc.camera.add_camera_pose(cam2world_matrix)
-        poses += 1
 
-print(f"Sampled {poses} camera poses after {tries} tries")
-if poses == 0:
-    raise RuntimeError("Could not find any valid camera pose - try lowering the coverage threshold.")
+def sample_camera_pose(max_tries=10000):
+    for _ in range(max_tries):
+        height = np.random.uniform(1.4, 1.8)
+        location = point_sampler.sample(height)
+        rotation = np.random.uniform([1.2217, 0, 0], [1.338, 0, 2 * np.pi])
+        candidate = bproc.math.build_transformation_mat(location, rotation)
+        if bproc.camera.scene_coverage_score(candidate) > 0.4 \
+                and bproc.camera.perform_obstacle_in_view_check(candidate, proximity_checks, bvh_tree):
+            return candidate
+    raise RuntimeError(f"Could not find a valid camera pose after {max_tries} tries.")
+
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +320,9 @@ def setup_material_aovs():
             aov_node.aov_name = input_name
 
             if socket.is_linked:
-                # A texture (or other node) drives this input - tap the same source.
                 src = socket.links[0].from_socket
                 links.new(src, aov_node.inputs["Value"])
             else:
-                # It's a constant value - feed that constant into the AOV.
                 val_node = nodes.new("ShaderNodeValue")
                 val_node.outputs[0].default_value = socket.default_value
                 links.new(val_node.outputs[0], aov_node.inputs["Value"])
@@ -374,76 +410,55 @@ if args.overwrite and os.path.exists(scene_dir):
 os.makedirs(scene_dir, exist_ok=True)
 print(f"Writing output to: {scene_dir}")
 
-gbuffer_tmp_dir = os.path.join(scene_dir, "_gbuffer_tmp")
-os.makedirs(gbuffer_tmp_dir, exist_ok=True)
 
-# All four of these ride along "for free" with one render call (Cycles
-# computes them as extra channels of the same pass for every view at once).
-# Blender's compositor can only write into one shared base_path per call,
-# appending a frame number per view - so they land in a flat temp folder
-# first, then get moved into their final <scene_id>/<cam_nr>/ folders below.
-_roughness_out = enable_aov_file_output(gbuffer_tmp_dir, "Roughness", "roughness_")
-_metallic_out = enable_aov_file_output(gbuffer_tmp_dir, "Metallic", "metallic_")
-_albedo_out = enable_diffuse_output_simple(gbuffer_tmp_dir, "albedo_")
-_normals_out = enable_normals_output_simple(gbuffer_tmp_dir, "normals_")
-
-print("Rendering G-buffers (albedo/normals/roughness/metallic) for all views...")
-# "colors" from this throwaway call is irrelevant (no lighting condition
-# applied yet) and return_data=False skips reloading it entirely - the
-# gbuffer files themselves are written as a side effect of the call.
-bproc.renderer.render(return_data=False)
-
-
-def move_gbuffers_into_view_folders(tmp_dir, dest_scene_dir, channel_prefixes):
-    """Moves channel_FRAME[_suffix].ext files from a flat temp folder into
-    dest_scene_dir/<cam_nr>/channel.ext. Tolerant of any unexpected filename
-    suffix Blender may add (e.g. the "_L" view-suffix quirk seen on this
-    machine), since the regex only anchors on the leading channel name and
-    frame digits, not on what (if anything) follows them."""
+def rename_gbuffer_files(view_dir, channel_prefixes):
+    """Renames channel_FRAME[_suffix].ext into a clean channel.ext name
+    (frame is always 0000 here, since keyframes get reset per view).
+    Tolerant of any unexpected suffix Blender may add (e.g. the "_L"
+    view-suffix quirk seen on this machine), since the regex only anchors
+    on the leading channel name and frame digits."""
     pattern = re.compile(r"^(" + "|".join(channel_prefixes) + r")_(\d{4}).*\.(png|exr)$")
-    moved = 0
-    for fname in os.listdir(tmp_dir):
+    for fname in os.listdir(view_dir):
         m = pattern.match(fname)
         if not m:
             continue
-        channel, frame_str, ext = m.group(1), m.group(2), m.group(3)
-        cam_dir = os.path.join(dest_scene_dir, str(int(frame_str)))
-        os.makedirs(cam_dir, exist_ok=True)
-        shutil.move(os.path.join(tmp_dir, fname), os.path.join(cam_dir, f"{channel}.{ext}"))
-        moved += 1
-    return moved
+        channel, _frame, ext = m.group(1), m.group(2), m.group(3)
+        src = os.path.join(view_dir, fname)
+        dest = os.path.join(view_dir, f"{channel}.{ext}")
+        if os.path.abspath(src) != os.path.abspath(dest):
+            shutil.move(src, dest)
 
 
-num_moved = move_gbuffers_into_view_folders(
-    gbuffer_tmp_dir, scene_dir, ["albedo", "normals", "roughness", "metallic"]
-)
-print(f"Moved {num_moved} G-buffer file(s) into per-view folders under {scene_dir}")
-try:
-    os.rmdir(gbuffer_tmp_dir)
-except OSError:
-    print(f"Note: {gbuffer_tmp_dir} wasn't empty after moving - check it for unexpectedly named files.")
+def capture_gbuffers_for_view(view_dir):
+    """Creates the gbuffer compositor output nodes fresh, renders this
+    view's albedo/normals/roughness/metallic, renames the files, then
+    removes the nodes again - so they don't keep firing (and re-cluttering
+    this folder) during the light-retry renders that follow."""
+    nodes = [
+        enable_aov_file_output(view_dir, "Roughness", "roughness_"),
+        enable_aov_file_output(view_dir, "Metallic", "metallic_"),
+        enable_diffuse_output_simple(view_dir, "albedo_"),
+        enable_normals_output_simple(view_dir, "normals_"),
+    ]
+    bproc.renderer.render(return_data=False)
+    rename_gbuffer_files(view_dir, ["albedo", "normals", "roughness", "metallic"])
 
-# Disconnect the gbuffer output nodes now that they've done their one-time
-# job - otherwise they'd keep firing (and recreating gbuffer_tmp_dir) during
-# every one of the M lighting-condition renders below, which is both wasted
-# I/O and would leave redundant leftover files since nothing moves them
-# again after this point.
-_gbuffer_compositor_tree = bpy.context.scene.node_tree
-for _node in (_roughness_out, _metallic_out, _albedo_out, _normals_out):
-    _gbuffer_compositor_tree.nodes.remove(_node)
+    tree = bpy.context.scene.node_tree
+    for node in nodes:
+        tree.nodes.remove(node)
 
 
 # ---------------------------------------------------------------------------
-# Random lighting conditions (M total). Each condition is 1-3 point/area
+# Random lighting condition generator. Each condition is 1-3 point/area
 # lights with randomized position, color, energy, and size:
-#   - POINT lights: "size" is the soft-shadow radius (0 = sharp point source,
-#     larger = softer/dimmer, see set_radius()).
-#   - AREA lights: "size" is the physical width/height of the emitting plane
-#     (set directly on the underlying Blender light data - BlenderProc's
-#     Light wrapper has no dedicated method for this, only for the point-
-#     light-style radius).
-# Colors are sampled in HSV with capped saturation, to keep them as plausible
-# (if varied) light colors rather than fully random/garish RGB combinations.
+#   - POINT lights: "size" is the soft-shadow radius (0 = sharp point
+#     source, larger = softer/dimmer, see set_radius()).
+#   - AREA lights: "size" is the physical width/height of the emitting
+#     plane (set directly on the underlying Blender light data -
+#     BlenderProc's Light wrapper has no dedicated method for this, only
+#     for the point-light-style radius).
+# Colors are sampled in HSV with capped saturation, to keep them as
+# plausible (if varied) light colors rather than fully random/garish RGB.
 # ---------------------------------------------------------------------------
 bbox = np.array([o.get_bound_box() for o in mesh_objects]).reshape(-1, 3)
 room_min = bbox.min(axis=0)
@@ -491,22 +506,6 @@ def create_lights_from_spec(light_specs):
     return created
 
 
-light_setups = [sample_random_light_setup() for _ in range(args.num_light_setups)]
-
-manifest_path = os.path.join(scene_dir, "light_conditions.json")
-with open(manifest_path, "w", encoding="utf-8") as f:
-    json.dump(
-        {f"light_{idx:03d}": specs for idx, specs in enumerate(light_setups)},
-        f, indent=2
-    )
-print(f"Generated {len(light_setups)} light condition(s); manifest written to {manifest_path}")
-
-
-# ---------------------------------------------------------------------------
-# Render: M lighting conditions, each across all N views, written directly
-# into <scene_id>/<cam_nr>/light_XXX.png. Only "colors" is reloaded via
-# BlenderProc's own mechanism (which works fine).
-# ---------------------------------------------------------------------------
 def to_uint8_image(arr):
     arr = np.asarray(arr)
     if arr.dtype == np.uint8:
@@ -521,25 +520,124 @@ def save_png(arr, path):
     Image.fromarray(to_uint8_image(arr).astype(np.uint8)).save(path)
 
 
-for idx, light_specs in enumerate(light_setups):
-    light_name = f"light_{idx:03d}"
-    created_lights = create_lights_from_spec(light_specs)
+def average_brightness(img):
+    """Mean perceptual luminance of an image, normalized to [0, 1]."""
+    arr = np.asarray(img, dtype=np.float32)
+    if arr.max() > 1.5:  # detect 0-255 range vs already-0-1 range
+        arr = arr / 255.0
+    if arr.ndim == 3 and arr.shape[-1] >= 3:
+        luminance = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    else:
+        luminance = arr
+    return float(luminance.mean())
 
-    data = bproc.renderer.render(load_keys={"colors"})
 
-    for i, img in enumerate(data["colors"]):
-        cam_dir = os.path.join(scene_dir, str(i))
-        os.makedirs(cam_dir, exist_ok=True)
-        save_png(img, os.path.join(cam_dir, f"{light_name}.png"))
+def channel_std(view_dir, channel):
+    """Standard deviation (0-1 normalized) of a single-channel gbuffer PNG
+    already written to view_dir by capture_gbuffers_for_view."""
+    arr = np.array(Image.open(os.path.join(view_dir, f"{channel}.png"))).astype(np.float32)
+    max_val = 65535.0 if arr.max() > 255.5 else 255.0  # 16-bit vs 8-bit PNG
+    return float((arr / max_val).std())
 
-    for light in created_lights:
-        light.delete()
 
-    print(f"Rendered {light_name} ({len(light_specs)} light(s)) across {poses} view(s)")
+def gbuffer_variation_ok(view_dir, min_std):
+    """Rejects a view whose roughness or metallic map is essentially flat
+    across the whole frame (e.g. a close-up of a single material) - such a
+    view carries little useful material information."""
+    roughness_std = channel_std(view_dir, "roughness")
+    metallic_std = channel_std(view_dir, "metallic")
+    ok = roughness_std >= min_std and metallic_std >= min_std
+    return ok, roughness_std, metallic_std
+
+
+# ---------------------------------------------------------------------------
+# Per-view rendering: for each view, capture its G-buffer once, then fill
+# all M light slots, regenerating + re-rendering any light condition whose
+# resulting average brightness falls outside [brightness_min, brightness_max]
+# (up to max_light_retries attempts before giving up and keeping the last
+# attempt anyway, so every view always ends up with exactly M images).
+#
+# This replaces the earlier approach of pregenerating M lighting conditions
+# once for the whole scene and applying them across all views - validity is
+# now checked render-by-render instead, since the same light setup can be
+# well-exposed from one viewpoint and not another.
+# ---------------------------------------------------------------------------
+manifest = {}
+
+for view_idx in range(args.num_camera_poses):
+    view_dir = os.path.join(scene_dir, str(view_idx))
+    os.makedirs(view_dir, exist_ok=True)
+
+    view_tries = 0
+    view_ok = False
+    roughness_std = metallic_std = None
+    while not view_ok and view_tries < args.max_view_retries:
+        view_tries += 1
+        cam2world_matrix = sample_camera_pose()
+
+        bproc.utility.reset_keyframes()
+        bproc.camera.add_camera_pose(cam2world_matrix)
+        capture_gbuffers_for_view(view_dir)
+
+        view_ok, roughness_std, metallic_std = gbuffer_variation_ok(view_dir, args.min_material_std)
+        if not view_ok:
+            print(f"view {view_idx}: gbuffer too 'boring' (roughness_std={roughness_std:.4f}, "
+                  f"metallic_std={metallic_std:.4f}, attempt {view_tries}) - resampling a new view")
+
+    view_status = "accepted" if view_ok else f"gave up after {view_tries} attempt(s), kept last"
+    print(f"view {view_idx}: roughness_std={roughness_std:.4f}, metallic_std={metallic_std:.4f} ({view_status})")
+
+    view_manifest = {
+        "_view": {
+            "tries": view_tries,
+            "accepted": view_ok,
+            "roughness_std": roughness_std,
+            "metallic_std": metallic_std,
+        }
+    }
+    for light_idx in range(args.num_light_setups):
+        light_name = f"light_{light_idx:03d}"
+        accepted = False
+        attempt = 0
+        light_spec = None
+        brightness = None
+
+        while not accepted and attempt < args.max_light_retries:
+            attempt += 1
+            light_spec = sample_random_light_setup()
+            created_lights = create_lights_from_spec(light_spec)
+
+            data = bproc.renderer.render(load_keys={"colors"})
+            img = data["colors"][0]
+            brightness = average_brightness(img)
+            accepted = args.brightness_min <= brightness <= args.brightness_max
+
+            if accepted or attempt == args.max_light_retries:
+                save_png(img, os.path.join(view_dir, f"{light_name}.png"))
+
+            for light in created_lights:
+                light.delete()
+
+        status = "accepted" if accepted else f"gave up after {attempt} attempt(s), kept last"
+        print(f"view {view_idx} {light_name}: brightness={brightness:.3f} ({status})")
+
+        view_manifest[light_name] = {
+            "light_spec": light_spec,
+            "brightness": brightness,
+            "attempts": attempt,
+            "accepted": accepted,
+        }
+
+    manifest[str(view_idx)] = view_manifest
+    print(f"View {view_idx}/{args.num_camera_poses - 1} done -> {view_dir}")
+
+manifest_path = os.path.join(scene_dir, "light_conditions.json")
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
 
 print("\nDone.")
-print(f"{len(light_setups)} light condition(s) x {poses} view(s) = "
-      f"{len(light_setups) * poses} total renderings")
+print(f"{args.num_camera_poses} view(s) x {args.num_light_setups} light condition(s) = "
+      f"{args.num_camera_poses * args.num_light_setups} total renderings")
 print(f"Output layout: {scene_dir}/<cam_nr>/{{albedo,normals,roughness,metallic}}.png "
-      f"+ light_000.png ... light_{len(light_setups) - 1:03d}.png")
+      f"+ light_000.png ... light_{args.num_light_setups - 1:03d}.png")
 print("Light condition manifest:", manifest_path)
