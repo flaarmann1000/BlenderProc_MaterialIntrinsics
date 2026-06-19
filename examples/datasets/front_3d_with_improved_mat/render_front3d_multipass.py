@@ -22,10 +22,13 @@ viewpoint and not another. Output layout:
       the resulting brightness, and how many attempts it took.
     <cam_nr>/                  (one folder per view, cam_nr = 0, 1, 2, ...)
       albedo.png                  - diffuse base color   (lighting-independent)
-      normals.png                 - surface normals      (lighting-independent)
+      normals.png                 - camera-space normals (lighting-independent)
       roughness.png               - 16-bit material roughness (lighting-independent)
       metallic.png                - 16-bit material metallic  (lighting-independent)
       light_000.png ... light_MMM.png  - beauty render under each lighting condition
+      light_000_no_shadow.png ... (only if --no_shadow_pass is set) - same
+        lighting condition re-rendered with every light's shadow casting
+        disabled, all other parameters identical
 
 scene_id is derived from the input scene .json's filename (without extension).
 
@@ -41,6 +44,17 @@ metallic map turns out essentially flat across the whole frame (std below
 --min_material_std, e.g. a close-up of a single material), the camera pose
 is discarded and a fresh one sampled instead, up to --max_view_retries
 attempts (after which the last attempt is kept anyway).
+
+Each lighting condition's brightness check uses a cheap low-sample preview
+render (--preview_samples, default 10) rather than a full-quality render,
+since most candidates get rejected; only the accepted condition (or the
+last attempt, if --max_light_retries is exhausted) is re-rendered once at
+full quality (--samples, default 512) before being saved.
+
+Each random lighting condition is made of 1-3 POINT and/or SUN (directional)
+lights rather than POINT/AREA - SUN lights behave like real sunlight, with
+direction set by rotation rather than position, and energy on a much
+smaller W/m^2 scale than POINT/AREA's Watts.
 
 NOTE on file naming: albedo/normals/roughness/metallic are all written
 DIRECTLY to disk by manual compositor "File Output" nodes, bypassing
@@ -59,14 +73,11 @@ Usage:
       [--cc_material_path CC_TEXTURES_DIR] [--metal_material_list PATH] \
       [--num_camera_poses N] [--num_light_setups M] [--seed N] [--resolution N] \
       [--brightness_min F] [--brightness_max F] [--max_light_retries N] \
-      [--min_material_std F] [--max_view_retries N]
+      [--min_material_std F] [--max_view_retries N] \
+      [--samples N] [--preview_samples N] [--no_shadow_pass | --no-no_shadow_pass]
 
   All positional/optional arguments default to Felix's actual dataset paths
   if omitted - pass your own values to override any of them.
-
-blenderproc run render_front3d_multipass.py --num_camera_poses 4 --num_light_setups 16 --resolution 512
-blenderproc run render_front3d_multipass.py --num_camera_poses 2 --num_light_setups 2 --resolution 124
-
 """
 
 import argparse
@@ -111,9 +122,11 @@ parser.add_argument("--metal_material_list",
                           "non-zero ground truth instead of relying on a random draw across "
                           "mostly-non-metallic categories. Pass --metal_material_list none to "
                           "fall back to drawing from the general 'Metal' category instead.")
-parser.add_argument("--num_camera_poses", type=int, default=2,
+parser.add_argument("--num_camera_poses", type=int, default=4,
+# parser.add_argument("--num_camera_poses", type=int, default=4,
                      help="Number of views (N) to sample in the scene")
-parser.add_argument("--num_light_setups", type=int, default=3,
+parser.add_argument("--num_light_setups", type=int, default=1,
+# parser.add_argument("--num_light_setups", type=int, default=16,
                      help="Number of random lighting conditions (M) to generate; each is "
                           "rendered across all N views")
 parser.add_argument("--seed", type=int, default=None,
@@ -124,9 +137,9 @@ parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, defaul
                           "--no-overwrite to keep/merge into an existing folder instead.")
 parser.add_argument("--resolution", type=int, default=124,
                      help="Square render resolution")
-parser.add_argument("--brightness_min", type=float, default=0.2,
+parser.add_argument("--brightness_min", type=float, default=0.4,
                      help="Minimum acceptable average image brightness (0-1 luminance)")
-parser.add_argument("--brightness_max", type=float, default=0.8,
+parser.add_argument("--brightness_max", type=float, default=0.7,
                      help="Maximum acceptable average image brightness (0-1 luminance)")
 parser.add_argument("--max_light_retries", type=int, default=15,
                      help="Max attempts to find a light condition within the brightness range "
@@ -141,6 +154,19 @@ parser.add_argument("--max_view_retries", type=int, default=10,
                      help="Max attempts to find a camera pose whose G-buffer isn't 'boring' "
                           "(see --min_material_std) before giving up and keeping the last "
                           "attempt anyway")
+parser.add_argument("--samples", type=int, default=512,
+                     help="Max Cycles samples per pixel for FINAL/accepted renderings "
+                          "(BlenderProc's own default is 1024 - this lowers it for speed).")
+parser.add_argument("--preview_samples", type=int, default=10,
+                     help="Max Cycles samples per pixel used while testing whether a candidate "
+                          "lighting condition falls in the target brightness range. Kept low "
+                          "since these are throwaway checks - only the final accepted render "
+                          "(or the last attempt, if --max_light_retries is exhausted) is "
+                          "re-rendered at --samples quality.")
+parser.add_argument("--no_shadow_pass", action=argparse.BooleanOptionalAction, default=True,
+                     help="If set, render an additional shadow-free version of every accepted "
+                          "light condition (all lights' cast_shadow disabled), saved alongside "
+                          "the normal one as light_XXX_no_shadow.png in the same view folder.")
 args = parser.parse_args()
 
 if args.cc_material_path and args.cc_material_path.strip().lower() in ("none", ""):
@@ -168,6 +194,11 @@ if args.seed is not None:
     np.random.seed(args.seed)
 
 bproc.init()
+bproc.renderer.set_max_amount_of_samples(args.samples)
+
+# Disable all display/view transforms so every output (G-buffers AND beauty
+# renders) is saved in raw linear light with no tonemapping or gamma applied.
+bpy.context.scene.view_settings.view_transform = "Raw"
 
 # Defensive - see module docstring. Doesn't appear to be the actual cause of
 # the "_L" suffix issue on this machine, but harmless to keep set.
@@ -304,7 +335,6 @@ def setup_material_aovs():
             aov = view_layer.aovs.add()
             aov.name = name
             aov.type = "VALUE"
-
     for mat in bpy.data.materials:
         if not mat.use_nodes or mat.node_tree is None:
             continue
@@ -346,7 +376,9 @@ def enable_aov_file_output(output_dir, aov_name, file_prefix):
     out_node.format.file_format = "PNG"
     out_node.format.color_mode = "BW"
     out_node.format.color_depth = "16"
-    out_node.file_slots.values()[0].path = file_prefix
+    slot = out_node.file_slots.values()[0]
+    slot.path = file_prefix
+    slot.save_as_render = False
     tree.links.new(socket, out_node.inputs[0])
     return out_node
 
@@ -364,17 +396,17 @@ def enable_diffuse_output_simple(output_dir, file_prefix="albedo_"):
     out_node = tree.nodes.new("CompositorNodeOutputFile")
     out_node.base_path = output_dir
     out_node.format.file_format = "PNG"
-    out_node.file_slots.values()[0].path = file_prefix
+    slot = out_node.file_slots.values()[0]
+    slot.path = file_prefix
+    slot.save_as_render = False
     tree.links.new(render_layer_node.outputs["DiffCol"], out_node.inputs[0])
     return out_node
 
 
 def enable_normals_output_simple(output_dir, file_prefix="normals_"):
-    """Writes a simple world-space normal map directly to disk, bypassing
-    BlenderProc's own enable_normals_output (which also relies on the
-    reload mechanism that's crashing here). This is a simpler remap than
-    BlenderProc's camera-space version (just normal*0.5+0.5 -> 0..1), but
-    perfectly valid ground truth for most downstream uses."""
+    """Writes world-space normals to disk via the built-in Normal render pass,
+    remapped to [0,1] (n*0.5+0.5). The caller is responsible for transforming
+    to camera space afterwards using transform_normals_to_camera_space()."""
     bpy.context.view_layer.use_pass_normal = True
     bpy.context.scene.render.use_compositing = True
     bpy.context.scene.use_nodes = True
@@ -396,9 +428,34 @@ def enable_normals_output_simple(output_dir, file_prefix="normals_"):
     out_node.base_path = output_dir
     out_node.format.file_format = "PNG"
     out_node.format.color_depth = "16"
-    out_node.file_slots.values()[0].path = file_prefix
+    slot = out_node.file_slots.values()[0]
+    slot.path = file_prefix
+    slot.save_as_render = False   # write linear values — skip sRGB display transform
     tree.links.new(mix_add.outputs["Image"], out_node.inputs[0])
     return out_node
+
+
+def transform_normals_to_camera_space(view_dir, cam2world_matrix):
+    """Loads the world-space normals PNG written by Blender, transforms each
+    normal to camera space using the known cam2world rotation, and overwrites
+    the file as an 8-bit RGB PNG (sufficient precision for normal maps).
+
+    Math: cam2world_matrix[:3,:3] maps camera→world, so its transpose maps
+    world→camera. For row-vector normals: n_cam = n_world @ R_cam2world,
+    which is equivalent to n_cam = (R_cam2world.T @ n_world.T).T."""
+    normals_path = os.path.join(view_dir, "normals.png")
+    img = np.array(Image.open(normals_path)).astype(np.float32)
+    max_val = 65535.0 if img.max() > 255.5 else 255.0
+    n_world = img / max_val * 2.0 - 1.0          # (H, W, 3) in [-1, 1]
+
+    R = cam2world_matrix[:3, :3]                  # camera→world rotation
+    H, W = n_world.shape[:2]
+    n_cam = n_world.reshape(-1, 3) @ R            # world→camera (row vectors)
+    n_cam /= np.linalg.norm(n_cam, axis=1, keepdims=True).clip(min=1e-8)
+    n_cam = n_cam.reshape(H, W, 3)
+
+    encoded = ((n_cam + 1.0) * 0.5 * 255.0).clip(0, 255).astype(np.uint8)
+    Image.fromarray(encoded).save(normals_path)
 
 
 setup_material_aovs()
@@ -430,11 +487,13 @@ def rename_gbuffer_files(view_dir, channel_prefixes):
             shutil.move(src, dest)
 
 
-def capture_gbuffers_for_view(view_dir):
+def capture_gbuffers_for_view(view_dir, cam2world_matrix):
     """Creates the gbuffer compositor output nodes fresh, renders this
     view's albedo/normals/roughness/metallic, renames the files, then
     removes the nodes again - so they don't keep firing (and re-cluttering
-    this folder) during the light-retry renders that follow."""
+    this folder) during the light-retry renders that follow.
+    Normals are captured world-space and then transformed to camera space
+    in Python (avoids Blender compositor clamping of negative components)."""
     nodes = [
         enable_aov_file_output(view_dir, "Roughness", "roughness_"),
         enable_aov_file_output(view_dir, "Metallic", "metallic_"),
@@ -443,6 +502,7 @@ def capture_gbuffers_for_view(view_dir):
     ]
     bproc.renderer.render(return_data=False)
     rename_gbuffer_files(view_dir, ["albedo", "normals", "roughness", "metallic"])
+    transform_normals_to_camera_space(view_dir, cam2world_matrix)
 
     tree = bpy.context.scene.node_tree
     for node in nodes:
@@ -450,14 +510,20 @@ def capture_gbuffers_for_view(view_dir):
 
 
 # ---------------------------------------------------------------------------
-# Random lighting condition generator. Each condition is 1-3 point/area
-# lights with randomized position, color, energy, and size:
-#   - POINT lights: "size" is the soft-shadow radius (0 = sharp point
-#     source, larger = softer/dimmer, see set_radius()).
-#   - AREA lights: "size" is the physical width/height of the emitting
-#     plane (set directly on the underlying Blender light data -
-#     BlenderProc's Light wrapper has no dedicated method for this, only
-#     for the point-light-style radius).
+# Random lighting condition generator. Each condition is 1-3 point/sun
+# lights with randomized parameters:
+#   - POINT lights: positioned randomly within the room, "size" is the
+#     soft-shadow radius (0 = sharp point source, larger = softer/dimmer,
+#     see set_radius()), energy in Watts.
+#   - SUN lights: directional (like real sunlight) - position is
+#     irrelevant in Blender for these (see Blender manual: "because the
+#     light is emitted from a location considered infinitely far away, the
+#     location of a sun light does not affect the rendered result"), only
+#     rotation matters, so direction is randomized via Euler angles
+#     instead. Energy is in W/m^2, a much smaller scale than point/area
+#     Watts (real sunlight is roughly 1-5 W/m^2 in Blender's units), and
+#     "size" here is the angular diameter (soft-shadow control, analogous
+#     to the sun's real angular size in the sky).
 # Colors are sampled in HSV with capped saturation, to keep them as
 # plausible (if varied) light colors rather than fully random/garish RGB.
 # ---------------------------------------------------------------------------
@@ -471,22 +537,28 @@ def sample_random_light_setup():
     num_lights = np.random.randint(1, 4)  # 1-3 lights per condition
     specs = []
     for _ in range(num_lights):
-        light_type = random.choice(["POINT", "AREA"])
-        location = [
-            float(np.random.uniform(room_min[0], room_max[0])),
-            float(np.random.uniform(room_min[1], room_max[1])),
-            float(np.random.uniform(ceiling_z * 0.5, ceiling_z - 0.05)),
-        ]
+        light_type = random.choice(["POINT", "SUN"])
         hue = float(np.random.uniform(0, 1))
         saturation = float(np.random.uniform(0.0, 0.5))
         color = list(colorsys.hsv_to_rgb(hue, saturation, 1.0))
-        energy = float(np.random.uniform(100, 1000))
 
-        spec = dict(type=light_type, location=location, energy=energy, color=color)
-        if light_type == "AREA":
-            spec["size"] = float(np.random.uniform(0.2, 1.5))
+        spec = dict(type=light_type, color=color)
+        if light_type == "SUN":
+            spec["rotation_euler"] = [
+                float(np.random.uniform(0, np.pi)),       # tilt from straight down
+                float(np.random.uniform(0, 2 * np.pi)),   # roll
+                float(np.random.uniform(0, 2 * np.pi)),   # azimuth (compass direction)
+            ]
+            spec["energy"] = float(np.random.uniform(0.5, 4.0))   # W/m^2
+            spec["size"] = float(np.random.uniform(0.01, 0.3))     # angular diameter (radians)
         else:
-            spec["size"] = float(np.random.uniform(0.02, 0.4))
+            spec["location"] = [
+                float(np.random.uniform(room_min[0], room_max[0])),
+                float(np.random.uniform(room_min[1], room_max[1])),
+                float(np.random.uniform(ceiling_z * 0.5, ceiling_z - 0.05)),
+            ]
+            spec["energy"] = float(np.random.uniform(100, 1000))   # Watts
+            spec["size"] = float(np.random.uniform(0.02, 0.4))     # soft-shadow radius (meters)
         specs.append(spec)
     return specs
 
@@ -496,12 +568,13 @@ def create_lights_from_spec(light_specs):
     for spec in light_specs:
         light = bproc.types.Light()
         light.set_type(spec["type"])
-        light.set_location(spec["location"])
         light.set_energy(spec["energy"])
         light.set_color(spec["color"])
-        if spec["type"] == "AREA":
-            light.blender_obj.data.size = spec["size"]
+        if spec["type"] == "SUN":
+            light.blender_obj.rotation_euler = spec["rotation_euler"]
+            light.blender_obj.data.angle = spec["size"]
         else:
+            light.set_location(spec["location"])
             light.set_radius(spec["size"])
         created.append(light)
     return created
@@ -578,7 +651,7 @@ for view_idx in range(args.num_camera_poses):
 
         bproc.utility.reset_keyframes()
         bproc.camera.add_camera_pose(cam2world_matrix)
-        capture_gbuffers_for_view(view_dir)
+        capture_gbuffers_for_view(view_dir, cam2world_matrix)
 
         view_ok, roughness_std, metallic_std = gbuffer_variation_ok(view_dir, args.min_material_std)
         if not view_ok:
@@ -608,13 +681,43 @@ for view_idx in range(args.num_camera_poses):
             light_spec = sample_random_light_setup()
             created_lights = create_lights_from_spec(light_spec)
 
-            data = bproc.renderer.render(load_keys={"colors"})
-            img = data["colors"][0]
-            brightness = average_brightness(img)
+            # Cheap low-sample preview render just to test brightness - most
+            # candidates get rejected, so it'd be wasteful to render every
+            # attempt at full quality.
+            bproc.renderer.set_max_amount_of_samples(args.preview_samples)
+            preview_data = bproc.renderer.render(load_keys={"colors"})
+            brightness = average_brightness(preview_data["colors"][0])
             accepted = args.brightness_min <= brightness <= args.brightness_max
 
             if accepted or attempt == args.max_light_retries:
-                save_png(img, os.path.join(view_dir, f"{light_name}.png"))
+                # This condition is being kept - re-render once at full
+                # quality before saving (the preview render above is too
+                # noisy to use as the final output).
+                bproc.renderer.set_max_amount_of_samples(args.samples)
+                final_data = bproc.renderer.render(load_keys={"colors"})
+                save_png(final_data["colors"][0], os.path.join(view_dir, f"{light_name}.png"))
+
+                if args.no_shadow_pass:
+                    # Disable shadow casting on every light in this condition
+                    # and re-render once more at full quality - everything
+                    # else (positions/colors/energies) stays identical, only
+                    # direct shadows are removed.
+                    for light in created_lights:
+                        light_data = light.blender_obj.data
+                        # Blender 4.x (which current BlenderProc bundles)
+                        # exposes per-light shadow casting directly as
+                        # use_shadow on the light data-block - the older
+                        # light_data.cycles.cast_shadow property still
+                        # exists for backward compatibility but is a no-op
+                        # in current Cycles, which is why this previously
+                        # had zero effect. Set both to be safe across
+                        # versions.
+                        light_data.use_shadow = False
+                        if hasattr(light_data, "cycles") and hasattr(light_data.cycles, "cast_shadow"):
+                            light_data.cycles.cast_shadow = False
+                    no_shadow_data = bproc.renderer.render(load_keys={"colors"})
+                    save_png(no_shadow_data["colors"][0],
+                             os.path.join(view_dir, f"{light_name}_no_shadow.png"))
 
             for light in created_lights:
                 light.delete()
@@ -627,6 +730,7 @@ for view_idx in range(args.num_camera_poses):
             "brightness": brightness,
             "attempts": attempt,
             "accepted": accepted,
+            "no_shadow_pass": args.no_shadow_pass,
         }
 
     manifest[str(view_idx)] = view_manifest
