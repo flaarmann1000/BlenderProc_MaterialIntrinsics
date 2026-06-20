@@ -22,7 +22,7 @@ outside [brightness_min, brightness_max]. Output layout:
       Manifest of the accepted (or given-up-on) light condition per view:
       its exact parameters, the resulting brightness, and how many attempts.
     <cam_nr>/                  (one folder per view, cam_nr = 0, 1, 2, ...)
-      albedo.png / .exr            - diffuse base color   (lighting-independent)
+      albedo.png / .exr            - raw Base Color via AOV (both linear; PNG written via PIL, no sRGB)
       normals.png / .exr           - camera-space normals (PNG: uint8 encoded; EXR: raw [-1,1] float32)
       roughness.png / .exr         - material roughness   (lighting-independent)
       metallic.png / .exr          - material metallic    (lighting-independent)
@@ -332,6 +332,10 @@ def setup_material_aovs():
             aov = view_layer.aovs.add()
             aov.name = name
             aov.type = "VALUE"
+    if "Albedo" not in existing:
+        aov = view_layer.aovs.add()
+        aov.name = "Albedo"
+        aov.type = "COLOR"
     for mat in bpy.data.materials:
         if not mat.use_nodes or mat.node_tree is None:
             continue
@@ -354,6 +358,18 @@ def setup_material_aovs():
                 val_node = nodes.new("ShaderNodeValue")
                 val_node.outputs[0].default_value = socket.default_value
                 links.new(val_node.outputs[0], aov_node.inputs["Value"])
+
+        # Albedo AOV: wire Base Color directly (preserves texture links) so the
+        # output is the raw base color without DiffCol's (1-metallic) weighting.
+        color_socket = bsdf.inputs["Base Color"]
+        albedo_aov = nodes.new("ShaderNodeOutputAOV")
+        albedo_aov.aov_name = "Albedo"
+        if color_socket.is_linked:
+            links.new(color_socket.links[0].from_socket, albedo_aov.inputs["Color"])
+        else:
+            rgb_node = nodes.new("ShaderNodeRGB")
+            rgb_node.outputs[0].default_value = color_socket.default_value
+            links.new(rgb_node.outputs[0], albedo_aov.inputs["Color"])
 
 
 def enable_aov_file_output(output_dir, aov_name, file_prefix):
@@ -390,33 +406,27 @@ def enable_aov_file_output(output_dir, aov_name, file_prefix):
     return [out_node, exr_node]
 
 
-def enable_diffuse_output_simple(output_dir, file_prefix="albedo_"):
-    """Writes the diffuse color (albedo) pass directly to disk, bypassing
-    BlenderProc's enable_diffuse_color_output (whose reload step is what
-    crashes with the "_L" suffix issue on this machine)."""
-    bpy.context.view_layer.use_pass_diffuse_color = True
+def enable_albedo_output(output_dir, file_prefix="albedo_"):
+    """Writes the raw Base Color via the Albedo AOV (no metallic weighting).
+    Only writes EXR here; the linear PNG is produced in
+    capture_gbuffers_for_view() by loading this EXR back via bpy.data.images
+    (bypasses Blender's sRGB compositor encoding for PNG)."""
     bpy.context.scene.render.use_compositing = True
     bpy.context.scene.use_nodes = True
     tree = bpy.context.scene.node_tree
 
     render_layer_node = Utility.get_the_one_node_with_type(tree.nodes, "CompositorNodeRLayers")
-    out_node = tree.nodes.new("CompositorNodeOutputFile")
-    out_node.base_path = output_dir
-    out_node.format.file_format = "PNG"
-    slot = out_node.file_slots.values()[0]
-    slot.path = file_prefix
-    slot.save_as_render = False
-    tree.links.new(render_layer_node.outputs["DiffCol"], out_node.inputs[0])
 
     exr_node = tree.nodes.new("CompositorNodeOutputFile")
     exr_node.base_path = output_dir
     exr_node.format.file_format = "OPEN_EXR"
+    exr_node.format.color_mode = "RGB"
     exr_node.format.color_depth = "32"
     exr_slot = exr_node.file_slots.values()[0]
     exr_slot.path = file_prefix
     exr_slot.save_as_render = False
-    tree.links.new(render_layer_node.outputs["DiffCol"], exr_node.inputs[0])
-    return [out_node, exr_node]
+    tree.links.new(render_layer_node.outputs["Albedo"], exr_node.inputs[0])
+    return [exr_node]
 
 
 def enable_normals_output_simple(output_dir, file_prefix="normals_"):
@@ -514,12 +524,22 @@ def capture_gbuffers_for_view(view_dir, cam2world_matrix):
     node_groups = [
         enable_aov_file_output(view_dir, "Roughness", "roughness_"),
         enable_aov_file_output(view_dir, "Metallic", "metallic_"),
-        enable_diffuse_output_simple(view_dir, "albedo_"),
+        enable_albedo_output(view_dir, "albedo_"),
         enable_normals_output_simple(view_dir, "normals_"),
     ]
     bproc.renderer.render(return_data=False)
     rename_gbuffer_files(view_dir, ["albedo", "normals", "roughness", "metallic"])
     transform_normals_to_camera_space(view_dir, cam2world_matrix)
+
+    # Linear albedo PNG: load the EXR (scene-linear) and save via PIL (no sRGB).
+    _alb_exr = os.path.join(view_dir, "albedo.exr")
+    _alb_img = bpy.data.images.load(_alb_exr)
+    _alb_img.colorspace_settings.name = "Non-Color"
+    _alb_px = np.empty(_alb_img.size[0] * _alb_img.size[1] * 4, dtype=np.float32)
+    _alb_img.pixels.foreach_get(_alb_px)
+    _alb_arr = _alb_px.reshape(_alb_img.size[1], _alb_img.size[0], 4)[::-1, :, :3]
+    save_png(_alb_arr.copy(), os.path.join(view_dir, "albedo.png"))
+    bpy.data.images.remove(_alb_img)
 
     tree = bpy.context.scene.node_tree
     for group in node_groups:
