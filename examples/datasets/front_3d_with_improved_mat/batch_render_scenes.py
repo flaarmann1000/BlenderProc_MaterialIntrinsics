@@ -36,7 +36,7 @@ Usage:
   if omitted. Anything after a literal "--" is forwarded verbatim to every
   render_front3d_multipass.py call, e.g.:
 
-    python batch_render_scenes.py --num_scenes 5 -- --num_camera_poses 4 --num_light_setups 3 --no_shadow_pass
+    python batch_render_scenes.py --num_scenes 5
 """
 
 import argparse
@@ -52,7 +52,7 @@ parser.add_argument("future_folder", nargs="?", default=r"E:\3D-Front\3D-FUTURE-
                      help="Path to the 3D-FUTURE-model folder")
 parser.add_argument("front_texture", nargs="?", default=r"E:\3D-Front\3D-FRONT-texture",
                      help="Path to the 3D-FRONT-texture folder")
-parser.add_argument("output_dir", nargs="?", default="output",
+parser.add_argument("output_dir", nargs="?", default=r"E:\3D-Front\output",
                      help="Output directory passed through to render_front3d_multipass.py "
                           "(each scene gets its own <output_dir>/<scene_id>/ subfolder there)")
 parser.add_argument("--cc_material_path", default=r"E:\3D-Front\cctextures",

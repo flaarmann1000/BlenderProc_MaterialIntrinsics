@@ -5,30 +5,31 @@ render_front3d_multipass.py
 ============================
 
 Renders a 3D-FRONT scene with BlenderProc: N camera views, each with its own
-lighting-independent G-buffer plus M lighting conditions. For each view,
-every light condition is generated, rendered, and checked: if the resulting
-image's average brightness falls outside [brightness_min, brightness_max]
-(default 0.2-0.8), a new random light condition is generated and re-rendered,
-up to --max_light_retries attempts (after which the last attempt is kept
-anyway, so every view always ends up with exactly M images). This is done
-render-wise rather than pregenerating M lighting conditions for the whole
-scene up front, since the same light setup can be well-exposed from one
-viewpoint and not another. Output layout:
+lighting-independent G-buffer plus exactly three lighting conditions:
+
+  sun             – 1-3 random SUN (directional) lights, shadows disabled
+  point_shadow    – 1-3 random POINT lights, shadows enabled
+  point_no_shadow – same POINT light setup re-rendered with shadows disabled
+
+The sun and point setups are sampled independently per view. The two point
+renders share the same light configuration so shadow/no-shadow images are
+paired pixel-accurate. Each setup is brightness-checked with a cheap preview
+render and re-sampled up to --max_light_retries times if the result falls
+outside [brightness_min, brightness_max]. Output layout:
 
   <output_dir>/<scene_id>/
     light_conditions.json
-      Manifest of every accepted (or given-up-on) light condition per view:
-      its exact parameters (type/location/energy/color/size per light),
-      the resulting brightness, and how many attempts it took.
+      Manifest of the accepted (or given-up-on) light condition per view:
+      its exact parameters, the resulting brightness, and how many attempts.
     <cam_nr>/                  (one folder per view, cam_nr = 0, 1, 2, ...)
-      albedo.png                  - diffuse base color   (lighting-independent)
-      normals.png                 - camera-space normals (lighting-independent)
-      roughness.png               - 16-bit material roughness (lighting-independent)
-      metallic.png                - 16-bit material metallic  (lighting-independent)
-      light_000.png ... light_MMM.png  - beauty render under each lighting condition
-      light_000_no_shadow.png ... (only if --no_shadow_pass is set) - same
-        lighting condition re-rendered with every light's shadow casting
-        disabled, all other parameters identical
+      albedo.png / .exr            - diffuse base color   (lighting-independent)
+      normals.png / .exr           - camera-space normals (PNG: uint8 encoded; EXR: raw [-1,1] float32)
+      roughness.png / .exr         - material roughness   (lighting-independent)
+      metallic.png / .exr          - material metallic    (lighting-independent)
+      sun_<i>.png / _srgb.png / .exr           - SUN lights, no shadows        (i = 0..num_light_setups-1)
+      point_shadow_<i>.png / _srgb.png / .exr  - POINT lights, shadows on      (i = 0..num_light_setups-1)
+      point_no_shadow_<i>.png / _srgb.png / .exr - same POINT lights, shadows off (paired with point_shadow_<i>)
+      (linear .png = raw [0-1] clipped; _srgb.png = sRGB-encoded for display; .exr = linear float32)
 
 scene_id is derived from the input scene .json's filename (without extension).
 
@@ -71,10 +72,10 @@ Usage:
   blenderproc run render_front3d_multipass.py \
       [FRONT_JSON] [FUTURE_MODEL_DIR] [FRONT_TEXTURE_DIR] [OUTPUT_DIR] \
       [--cc_material_path CC_TEXTURES_DIR] [--metal_material_list PATH] \
-      [--num_camera_poses N] [--num_light_setups M] [--seed N] [--resolution N] \
+      [--num_camera_poses N] [--seed N] [--resolution N] \
       [--brightness_min F] [--brightness_max F] [--max_light_retries N] \
       [--min_material_std F] [--max_view_retries N] \
-      [--samples N] [--preview_samples N] [--no_shadow_pass | --no-no_shadow_pass]
+      [--samples N] [--preview_samples N]
 
   All positional/optional arguments default to Felix's actual dataset paths
   if omitted - pass your own values to override any of them.
@@ -122,13 +123,13 @@ parser.add_argument("--metal_material_list",
                           "non-zero ground truth instead of relying on a random draw across "
                           "mostly-non-metallic categories. Pass --metal_material_list none to "
                           "fall back to drawing from the general 'Metal' category instead.")
-parser.add_argument("--num_camera_poses", type=int, default=4,
-# parser.add_argument("--num_camera_poses", type=int, default=4,
+parser.add_argument("--num_camera_poses", type=int, default=2,
                      help="Number of views (N) to sample in the scene")
-parser.add_argument("--num_light_setups", type=int, default=1,
-# parser.add_argument("--num_light_setups", type=int, default=16,
-                     help="Number of random lighting conditions (M) to generate; each is "
-                          "rendered across all N views")
+parser.add_argument("--num_light_setups", type=int, default=16,
+                     help="Number of distinct lighting configurations to render per view per "
+                          "lighting type (sun / point). Each setup is independently sampled "
+                          "and brightness-checked. Outputs are named sun_0, sun_1, ... and "
+                          "point_shadow_0, point_no_shadow_0, etc.")
 parser.add_argument("--seed", type=int, default=None,
                      help="Optional random seed, for reproducible camera/light sampling")
 parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True,
@@ -137,7 +138,7 @@ parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, defaul
                           "--no-overwrite to keep/merge into an existing folder instead.")
 parser.add_argument("--resolution", type=int, default=124,
                      help="Square render resolution")
-parser.add_argument("--brightness_min", type=float, default=0.4,
+parser.add_argument("--brightness_min", type=float, default=0.3,
                      help="Minimum acceptable average image brightness (0-1 luminance)")
 parser.add_argument("--brightness_max", type=float, default=0.7,
                      help="Maximum acceptable average image brightness (0-1 luminance)")
@@ -163,10 +164,6 @@ parser.add_argument("--preview_samples", type=int, default=10,
                           "since these are throwaway checks - only the final accepted render "
                           "(or the last attempt, if --max_light_retries is exhausted) is "
                           "re-rendered at --samples quality.")
-parser.add_argument("--no_shadow_pass", action=argparse.BooleanOptionalAction, default=True,
-                     help="If set, render an additional shadow-free version of every accepted "
-                          "light condition (all lights' cast_shadow disabled), saved alongside "
-                          "the normal one as light_XXX_no_shadow.png in the same view folder.")
 args = parser.parse_args()
 
 if args.cc_material_path and args.cc_material_path.strip().lower() in ("none", ""):
@@ -380,7 +377,17 @@ def enable_aov_file_output(output_dir, aov_name, file_prefix):
     slot.path = file_prefix
     slot.save_as_render = False
     tree.links.new(socket, out_node.inputs[0])
-    return out_node
+
+    exr_node = tree.nodes.new("CompositorNodeOutputFile")
+    exr_node.base_path = output_dir
+    exr_node.format.file_format = "OPEN_EXR"
+    exr_node.format.color_mode = "RGB"
+    exr_node.format.color_depth = "32"
+    exr_slot = exr_node.file_slots.values()[0]
+    exr_slot.path = file_prefix
+    exr_slot.save_as_render = False
+    tree.links.new(socket, exr_node.inputs[0])
+    return [out_node, exr_node]
 
 
 def enable_diffuse_output_simple(output_dir, file_prefix="albedo_"):
@@ -400,7 +407,16 @@ def enable_diffuse_output_simple(output_dir, file_prefix="albedo_"):
     slot.path = file_prefix
     slot.save_as_render = False
     tree.links.new(render_layer_node.outputs["DiffCol"], out_node.inputs[0])
-    return out_node
+
+    exr_node = tree.nodes.new("CompositorNodeOutputFile")
+    exr_node.base_path = output_dir
+    exr_node.format.file_format = "OPEN_EXR"
+    exr_node.format.color_depth = "32"
+    exr_slot = exr_node.file_slots.values()[0]
+    exr_slot.path = file_prefix
+    exr_slot.save_as_render = False
+    tree.links.new(render_layer_node.outputs["DiffCol"], exr_node.inputs[0])
+    return [out_node, exr_node]
 
 
 def enable_normals_output_simple(output_dir, file_prefix="normals_"):
@@ -432,7 +448,7 @@ def enable_normals_output_simple(output_dir, file_prefix="normals_"):
     slot.path = file_prefix
     slot.save_as_render = False   # write linear values — skip sRGB display transform
     tree.links.new(mix_add.outputs["Image"], out_node.inputs[0])
-    return out_node
+    return [mix_scale, mix_add, out_node]
 
 
 def transform_normals_to_camera_space(view_dir, cam2world_matrix):
@@ -456,6 +472,7 @@ def transform_normals_to_camera_space(view_dir, cam2world_matrix):
 
     encoded = ((n_cam + 1.0) * 0.5 * 255.0).clip(0, 255).astype(np.uint8)
     Image.fromarray(encoded).save(normals_path)
+    save_exr(n_cam, normals_path.replace(".png", ".exr"))
 
 
 setup_material_aovs()
@@ -494,7 +511,7 @@ def capture_gbuffers_for_view(view_dir, cam2world_matrix):
     this folder) during the light-retry renders that follow.
     Normals are captured world-space and then transformed to camera space
     in Python (avoids Blender compositor clamping of negative components)."""
-    nodes = [
+    node_groups = [
         enable_aov_file_output(view_dir, "Roughness", "roughness_"),
         enable_aov_file_output(view_dir, "Metallic", "metallic_"),
         enable_diffuse_output_simple(view_dir, "albedo_"),
@@ -505,27 +522,16 @@ def capture_gbuffers_for_view(view_dir, cam2world_matrix):
     transform_normals_to_camera_space(view_dir, cam2world_matrix)
 
     tree = bpy.context.scene.node_tree
-    for node in nodes:
-        tree.nodes.remove(node)
+    for group in node_groups:
+        for node in (group if isinstance(group, list) else [group]):
+            tree.nodes.remove(node)
 
 
 # ---------------------------------------------------------------------------
-# Random lighting condition generator. Each condition is 1-3 point/sun
-# lights with randomized parameters:
-#   - POINT lights: positioned randomly within the room, "size" is the
-#     soft-shadow radius (0 = sharp point source, larger = softer/dimmer,
-#     see set_radius()), energy in Watts.
-#   - SUN lights: directional (like real sunlight) - position is
-#     irrelevant in Blender for these (see Blender manual: "because the
-#     light is emitted from a location considered infinitely far away, the
-#     location of a sun light does not affect the rendered result"), only
-#     rotation matters, so direction is randomized via Euler angles
-#     instead. Energy is in W/m^2, a much smaller scale than point/area
-#     Watts (real sunlight is roughly 1-5 W/m^2 in Blender's units), and
-#     "size" here is the angular diameter (soft-shadow control, analogous
-#     to the sun's real angular size in the sky).
-# Colors are sampled in HSV with capped saturation, to keep them as
-# plausible (if varied) light colors rather than fully random/garish RGB.
+# Light samplers — one per type.  Colors use capped-saturation HSV to stay
+# plausible rather than garish.  SUN lights are directional (position is
+# irrelevant in Blender; only rotation matters).  POINT lights are placed
+# randomly within the room volume near the ceiling.
 # ---------------------------------------------------------------------------
 bbox = np.array([o.get_bound_box() for o in mesh_objects]).reshape(-1, 3)
 room_min = bbox.min(axis=0)
@@ -533,34 +539,46 @@ room_max = bbox.max(axis=0)
 ceiling_z = bbox[:, 2].max()
 
 
-def sample_random_light_setup():
-    num_lights = np.random.randint(1, 4)  # 1-3 lights per condition
-    specs = []
-    for _ in range(num_lights):
-        light_type = random.choice(["POINT", "SUN"])
-        hue = float(np.random.uniform(0, 1))
-        saturation = float(np.random.uniform(0.0, 0.5))
-        color = list(colorsys.hsv_to_rgb(hue, saturation, 1.0))
+def _random_color():
+    return list(colorsys.hsv_to_rgb(
+        float(np.random.uniform(0, 1)),
+        float(np.random.uniform(0.0, 0.5)),
+        1.0,
+    ))
 
-        spec = dict(type=light_type, color=color)
-        if light_type == "SUN":
-            spec["rotation_euler"] = [
-                float(np.random.uniform(0, np.pi)),       # tilt from straight down
-                float(np.random.uniform(0, 2 * np.pi)),   # roll
-                float(np.random.uniform(0, 2 * np.pi)),   # azimuth (compass direction)
-            ]
-            spec["energy"] = float(np.random.uniform(0.5, 4.0))   # W/m^2
-            spec["size"] = float(np.random.uniform(0.01, 0.3))     # angular diameter (radians)
-        else:
-            spec["location"] = [
+
+def sample_sun_light_setup():
+    return [
+        dict(
+            type="SUN",
+            color=_random_color(),
+            rotation_euler=[
+                float(np.random.uniform(0, np.pi)),
+                float(np.random.uniform(0, 2 * np.pi)),
+                float(np.random.uniform(0, 2 * np.pi)),
+            ],
+            energy=float(np.random.uniform(0.5, 4.0)),
+            size=float(np.random.uniform(0.01, 0.3)),
+        )
+        for _ in range(np.random.randint(1, 4))
+    ]
+
+
+def sample_point_light_setup():
+    return [
+        dict(
+            type="POINT",
+            color=_random_color(),
+            location=[
                 float(np.random.uniform(room_min[0], room_max[0])),
                 float(np.random.uniform(room_min[1], room_max[1])),
                 float(np.random.uniform(ceiling_z * 0.5, ceiling_z - 0.05)),
-            ]
-            spec["energy"] = float(np.random.uniform(100, 1000))   # Watts
-            spec["size"] = float(np.random.uniform(0.02, 0.4))     # soft-shadow radius (meters)
-        specs.append(spec)
-    return specs
+            ],
+            energy=float(np.random.uniform(100, 1000)),
+            size=float(np.random.uniform(0.02, 0.4)),
+        )
+        for _ in range(np.random.randint(1, 4))
+    ]
 
 
 def create_lights_from_spec(light_specs):
@@ -580,6 +598,14 @@ def create_lights_from_spec(light_specs):
     return created
 
 
+def set_shadow(lights, enabled):
+    for light in lights:
+        d = light.blender_obj.data
+        d.use_shadow = enabled
+        if hasattr(d, "cycles") and hasattr(d.cycles, "cast_shadow"):
+            d.cycles.cast_shadow = enabled
+
+
 def to_uint8_image(arr):
     arr = np.asarray(arr)
     if arr.dtype == np.uint8:
@@ -592,6 +618,41 @@ def to_uint8_image(arr):
 
 def save_png(arr, path):
     Image.fromarray(to_uint8_image(arr).astype(np.uint8)).save(path)
+
+
+def save_exr(arr, path):
+    """Save a float32 numpy array as a 32-bit EXR via Blender's image API.
+    Pixels are stored as linear floats; no encoding or clamping is applied.
+    Uint8 [0-255] input (as returned by BlenderProc's colors key) is
+    normalized to [0, 1] before writing."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.max() > 1.5:   # uint8 [0-255] → normalize to [0, 1]
+        arr = arr / 255.0
+    H, W = arr.shape[:2]
+    if arr.ndim == 2:
+        rgba = np.stack([arr, arr, arr, np.ones((H, W), dtype=np.float32)], axis=-1)
+    elif arr.shape[2] == 3:
+        rgba = np.concatenate([arr, np.ones((H, W, 1), dtype=np.float32)], axis=-1)
+    else:
+        rgba = arr.copy()
+    img = bpy.data.images.new(os.path.basename(path), width=W, height=H, float_buffer=True)
+    img.pixels.foreach_set(rgba[::-1].reshape(-1).tolist())
+    img.file_format = "OPEN_EXR"
+    img.filepath_raw = path
+    img.save()
+    bpy.data.images.remove(img)
+
+
+def save_srgb_png(arr, path):
+    """Apply the sRGB transfer function to a linear image and save as PNG."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.max() > 1.5:   # uint8 [0-255] → normalize to [0, 1]
+        arr = arr / 255.0
+    arr = np.clip(arr, 0.0, 1.0)
+    srgb = np.where(arr <= 0.0031308,
+                    12.92 * arr,
+                    1.055 * arr ** (1.0 / 2.4) - 0.055)
+    Image.fromarray((srgb * 255.0).astype(np.uint8)).save(path)
 
 
 def average_brightness(img):
@@ -625,43 +686,63 @@ def gbuffer_variation_ok(view_dir, min_std):
 
 
 # ---------------------------------------------------------------------------
-# Per-view rendering: for each view, capture its G-buffer once, then fill
-# all M light slots, regenerating + re-rendering any light condition whose
-# resulting average brightness falls outside [brightness_min, brightness_max]
-# (up to max_light_retries attempts before giving up and keeping the last
-# attempt anyway, so every view always ends up with exactly M images).
-#
-# This replaces the earlier approach of pregenerating M lighting conditions
-# once for the whole scene and applying them across all views - validity is
-# now checked render-by-render instead, since the same light setup can be
-# well-exposed from one viewpoint and not another.
+# Per-view rendering loop.
 # ---------------------------------------------------------------------------
 manifest = {}
+accepted_setups = {}   # views where every light condition was accepted within retries
+
+
+def render_light_condition(sampler, use_shadow_for_preview):
+    """Sample a light setup, brightness-check with a preview render, then
+    render at full quality.  Returns (light_spec, brightness, attempts,
+    accepted, created_lights) with the lights still live in the scene so
+    the caller can flip shadows and render again before deleting them."""
+    accepted = False
+    attempt = 0
+    light_spec = None
+    brightness = None
+    created_lights = []
+
+    while not accepted and attempt < args.max_light_retries:
+        for l in created_lights:
+            l.delete()
+        attempt += 1
+        light_spec = sampler()
+        created_lights = create_lights_from_spec(light_spec)
+        set_shadow(created_lights, use_shadow_for_preview)
+
+        bproc.renderer.set_max_amount_of_samples(args.preview_samples)
+        preview = bproc.renderer.render(load_keys={"colors"})
+        brightness = average_brightness(preview["colors"][0])
+        accepted = args.brightness_min <= brightness <= args.brightness_max
+
+    return light_spec, brightness, attempt, accepted, created_lights
+
 
 for view_idx in range(args.num_camera_poses):
     view_dir = os.path.join(scene_dir, str(view_idx))
     os.makedirs(view_dir, exist_ok=True)
 
+    # ── Camera pose (retry if G-buffer is too uniform) ────────────────────
+    cam2world_matrix = None
     view_tries = 0
     view_ok = False
     roughness_std = metallic_std = None
     while not view_ok and view_tries < args.max_view_retries:
         view_tries += 1
         cam2world_matrix = sample_camera_pose()
-
         bproc.utility.reset_keyframes()
         bproc.camera.add_camera_pose(cam2world_matrix)
         capture_gbuffers_for_view(view_dir, cam2world_matrix)
-
         view_ok, roughness_std, metallic_std = gbuffer_variation_ok(view_dir, args.min_material_std)
         if not view_ok:
             print(f"view {view_idx}: gbuffer too 'boring' (roughness_std={roughness_std:.4f}, "
-                  f"metallic_std={metallic_std:.4f}, attempt {view_tries}) - resampling a new view")
+                  f"metallic_std={metallic_std:.4f}, attempt {view_tries}) - resampling")
 
     view_status = "accepted" if view_ok else f"gave up after {view_tries} attempt(s), kept last"
     print(f"view {view_idx}: roughness_std={roughness_std:.4f}, metallic_std={metallic_std:.4f} ({view_status})")
 
-    view_manifest = {
+    view_manifest: dict = {
         "_view": {
             "tries": view_tries,
             "accepted": view_ok,
@@ -669,80 +750,88 @@ for view_idx in range(args.num_camera_poses):
             "metallic_std": metallic_std,
         }
     }
+
+    # ── SUN lights, no shadows ────────────────────────────────────────────
+    sun_results = []
     for light_idx in range(args.num_light_setups):
-        light_name = f"light_{light_idx:03d}"
-        accepted = False
-        attempt = 0
-        light_spec = None
-        brightness = None
+        sun_spec, sun_brightness, sun_attempts, sun_accepted, sun_lights = \
+            render_light_condition(sample_sun_light_setup, use_shadow_for_preview=False)
+        set_shadow(sun_lights, False)
+        bproc.renderer.set_max_amount_of_samples(args.samples)
+        sun_data = bproc.renderer.render(load_keys={"colors"})
+        save_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.png"))
+        save_srgb_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}_srgb.png"))
+        save_exr(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.exr"))
+        for l in sun_lights:
+            l.delete()
+        status = "accepted" if sun_accepted else f"gave up after {sun_attempts} attempt(s)"
+        print(f"view {view_idx} sun[{light_idx}]: brightness={sun_brightness:.3f} ({status})")
+        sun_results.append({
+            "light_spec": sun_spec, "brightness": sun_brightness,
+            "attempts": sun_attempts, "accepted": sun_accepted,
+        })
 
-        while not accepted and attempt < args.max_light_retries:
-            attempt += 1
-            light_spec = sample_random_light_setup()
-            created_lights = create_lights_from_spec(light_spec)
+    view_manifest["sun"] = sun_results
 
-            # Cheap low-sample preview render just to test brightness - most
-            # candidates get rejected, so it'd be wasteful to render every
-            # attempt at full quality.
-            bproc.renderer.set_max_amount_of_samples(args.preview_samples)
-            preview_data = bproc.renderer.render(load_keys={"colors"})
-            brightness = average_brightness(preview_data["colors"][0])
-            accepted = args.brightness_min <= brightness <= args.brightness_max
+    # ── POINT lights — paired shadow / no-shadow ──────────────────────────
+    pt_results = []
+    for light_idx in range(args.num_light_setups):
+        pt_spec, pt_brightness, pt_attempts, pt_accepted, pt_lights = \
+            render_light_condition(sample_point_light_setup, use_shadow_for_preview=True)
+        bproc.renderer.set_max_amount_of_samples(args.samples)
 
-            if accepted or attempt == args.max_light_retries:
-                # This condition is being kept - re-render once at full
-                # quality before saving (the preview render above is too
-                # noisy to use as the final output).
-                bproc.renderer.set_max_amount_of_samples(args.samples)
-                final_data = bproc.renderer.render(load_keys={"colors"})
-                save_png(final_data["colors"][0], os.path.join(view_dir, f"{light_name}.png"))
+        set_shadow(pt_lights, True)
+        pt_shadow_data = bproc.renderer.render(load_keys={"colors"})
+        save_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.png"))
+        save_srgb_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}_srgb.png"))
+        save_exr(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.exr"))
 
-                if args.no_shadow_pass:
-                    # Disable shadow casting on every light in this condition
-                    # and re-render once more at full quality - everything
-                    # else (positions/colors/energies) stays identical, only
-                    # direct shadows are removed.
-                    for light in created_lights:
-                        light_data = light.blender_obj.data
-                        # Blender 4.x (which current BlenderProc bundles)
-                        # exposes per-light shadow casting directly as
-                        # use_shadow on the light data-block - the older
-                        # light_data.cycles.cast_shadow property still
-                        # exists for backward compatibility but is a no-op
-                        # in current Cycles, which is why this previously
-                        # had zero effect. Set both to be safe across
-                        # versions.
-                        light_data.use_shadow = False
-                        if hasattr(light_data, "cycles") and hasattr(light_data.cycles, "cast_shadow"):
-                            light_data.cycles.cast_shadow = False
-                    no_shadow_data = bproc.renderer.render(load_keys={"colors"})
-                    save_png(no_shadow_data["colors"][0],
-                             os.path.join(view_dir, f"{light_name}_no_shadow.png"))
+        set_shadow(pt_lights, False)
+        pt_noshadow_data = bproc.renderer.render(load_keys={"colors"})
+        save_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.png"))
+        save_srgb_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}_srgb.png"))
+        save_exr(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.exr"))
 
-            for light in created_lights:
-                light.delete()
+        for l in pt_lights:
+            l.delete()
+        status = "accepted" if pt_accepted else f"gave up after {pt_attempts} attempt(s)"
+        print(f"view {view_idx} point[{light_idx}]: brightness={pt_brightness:.3f} ({status})")
+        pt_results.append({
+            "light_spec": pt_spec, "brightness": pt_brightness,
+            "attempts": pt_attempts, "accepted": pt_accepted,
+        })
 
-        status = "accepted" if accepted else f"gave up after {attempt} attempt(s), kept last"
-        print(f"view {view_idx} {light_name}: brightness={brightness:.3f} ({status})")
-
-        view_manifest[light_name] = {
-            "light_spec": light_spec,
-            "brightness": brightness,
-            "attempts": attempt,
-            "accepted": accepted,
-            "no_shadow_pass": args.no_shadow_pass,
-        }
+    view_manifest["point"] = pt_results
 
     manifest[str(view_idx)] = view_manifest
+
+    sun_accepted_list = [r for r in sun_results if r["accepted"]]
+    pt_accepted_list  = [r for r in pt_results  if r["accepted"]]
+    if sun_accepted_list and pt_accepted_list and cam2world_matrix is not None:
+        accepted_setups[str(view_idx)] = {
+            "cam2world": cam2world_matrix.tolist(),
+            "sun":   [{"light_spec": r["light_spec"], "brightness": r["brightness"]}
+                      for r in sun_accepted_list],
+            "point": [{"light_spec": r["light_spec"], "brightness": r["brightness"]}
+                      for r in pt_accepted_list],
+        }
+
     print(f"View {view_idx}/{args.num_camera_poses - 1} done -> {view_dir}")
 
 manifest_path = os.path.join(scene_dir, "light_conditions.json")
 with open(manifest_path, "w", encoding="utf-8") as f:
     json.dump(manifest, f, indent=2)
 
+accepted_path = os.path.join(scene_dir, "accepted_setups.json")
+with open(accepted_path, "w", encoding="utf-8") as f:
+    json.dump(accepted_setups, f, indent=2)
+
 print("\nDone.")
-print(f"{args.num_camera_poses} view(s) x {args.num_light_setups} light condition(s) = "
-      f"{args.num_camera_poses * args.num_light_setups} total renderings")
-print(f"Output layout: {scene_dir}/<cam_nr>/{{albedo,normals,roughness,metallic}}.png "
-      f"+ light_000.png ... light_{args.num_light_setups - 1:03d}.png")
+print(f"{args.num_camera_poses} view(s), 3 renders each "
+      f"(sun / point_shadow / point_no_shadow) = "
+      f"{args.num_camera_poses * 3} total renderings")
+print(f"Accepted setups: {len(accepted_setups)}/{args.num_camera_poses} views "
+      f"-> {accepted_path}")
+print(f"Output: {scene_dir}/<cam_nr>/{{albedo,normals,roughness,metallic,"
+      f"sun,point_shadow,point_no_shadow}}.{{png,exr}}")
 print("Light condition manifest:", manifest_path)
