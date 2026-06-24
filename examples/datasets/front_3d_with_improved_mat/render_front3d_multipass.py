@@ -164,6 +164,14 @@ parser.add_argument("--preview_samples", type=int, default=10,
                           "since these are throwaway checks - only the final accepted render "
                           "(or the last attempt, if --max_light_retries is exhausted) is "
                           "re-rendered at --samples quality.")
+parser.add_argument("--accepted_setups", default=None,
+                     help="Path to an accepted_setups.json produced by a previous run of this "
+                          "script. When given, the scene is loaded identically but all camera "
+                          "sampling / gbuffer checks / brightness checks are skipped: only the "
+                          "exact camera poses and light specs recorded in the JSON are used. "
+                          "scene_dir is inferred from the JSON file's parent directory, so "
+                          "--output_dir is ignored. The neighbouring light_conditions.json is "
+                          "left untouched.")
 args = parser.parse_args()
 
 if args.cc_material_path and args.cc_material_path.strip().lower() in ("none", ""):
@@ -488,10 +496,14 @@ def transform_normals_to_camera_space(view_dir, cam2world_matrix):
 setup_material_aovs()
 
 scene_id = os.path.splitext(os.path.basename(args.front_json))[0]
-scene_dir = os.path.join(args.output_dir, scene_id)
-if args.overwrite and os.path.exists(scene_dir):
-    print(f"--overwrite is set: removing existing {scene_dir}")
-    shutil.rmtree(scene_dir)
+if args.accepted_setups:
+    # Re-render mode: scene_dir is where the JSON lives; never delete it.
+    scene_dir = os.path.dirname(os.path.abspath(args.accepted_setups))
+else:
+    scene_dir = os.path.join(args.output_dir, scene_id)
+    if args.overwrite and os.path.exists(scene_dir):
+        print(f"--overwrite is set: removing existing {scene_dir}")
+        shutil.rmtree(scene_dir)
 os.makedirs(scene_dir, exist_ok=True)
 print(f"Writing output to: {scene_dir}")
 
@@ -708,9 +720,6 @@ def gbuffer_variation_ok(view_dir, min_std):
 # ---------------------------------------------------------------------------
 # Per-view rendering loop.
 # ---------------------------------------------------------------------------
-manifest = {}
-accepted_setups = {}   # views where every light condition was accepted within retries
-
 
 def render_light_condition(sampler, use_shadow_for_preview):
     """Sample a light setup, brightness-check with a preview render, then
@@ -739,119 +748,178 @@ def render_light_condition(sampler, use_shadow_for_preview):
     return light_spec, brightness, attempt, accepted, created_lights
 
 
-for view_idx in range(args.num_camera_poses):
-    view_dir = os.path.join(scene_dir, str(view_idx))
-    os.makedirs(view_dir, exist_ok=True)
+if args.accepted_setups:
+    # ── Re-render from accepted_setups.json ──────────────────────────────────
+    with open(args.accepted_setups, encoding="utf-8") as _f:
+        _setups = json.load(_f)
+    print(f"Re-render mode: {len(_setups)} view(s) from {args.accepted_setups}")
 
-    # ── Camera pose (retry if G-buffer is too uniform) ────────────────────
-    cam2world_matrix = None
-    view_tries = 0
-    view_ok = False
-    roughness_std = metallic_std = None
-    while not view_ok and view_tries < args.max_view_retries:
-        view_tries += 1
-        cam2world_matrix = sample_camera_pose()
+    for _view_key, _setup in _setups.items():
+        view_idx = int(_view_key)
+        view_dir = os.path.join(scene_dir, str(view_idx))
+        os.makedirs(view_dir, exist_ok=True)
+
+        cam2world_matrix = np.array(_setup["cam2world"], dtype=np.float32)
         bproc.utility.reset_keyframes()
         bproc.camera.add_camera_pose(cam2world_matrix)
         capture_gbuffers_for_view(view_dir, cam2world_matrix)
-        view_ok, roughness_std, metallic_std = gbuffer_variation_ok(view_dir, args.min_material_std)
-        if not view_ok:
-            print(f"view {view_idx}: gbuffer too 'boring' (roughness_std={roughness_std:.4f}, "
-                  f"metallic_std={metallic_std:.4f}, attempt {view_tries}) - resampling")
 
-    view_status = "accepted" if view_ok else f"gave up after {view_tries} attempt(s), kept last"
-    print(f"view {view_idx}: roughness_std={roughness_std:.4f}, metallic_std={metallic_std:.4f} ({view_status})")
+        for light_idx, sun_entry in enumerate(_setup["sun"]):
+            sun_lights = create_lights_from_spec(sun_entry["light_spec"])
+            set_shadow(sun_lights, False)
+            bproc.renderer.set_max_amount_of_samples(args.samples)
+            sun_data = bproc.renderer.render(load_keys={"colors"})
+            save_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.png"))
+            save_srgb_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}_srgb.png"))
+            save_exr(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.exr"))
+            for l in sun_lights:
+                l.delete()
+            print(f"view {view_idx} sun[{light_idx}]: re-rendered "
+                  f"(stored brightness={sun_entry['brightness']:.3f})")
 
-    view_manifest: dict = {
-        "_view": {
-            "tries": view_tries,
-            "accepted": view_ok,
-            "roughness_std": roughness_std,
-            "metallic_std": metallic_std,
-        }
-    }
+        for light_idx, pt_entry in enumerate(_setup["point"]):
+            pt_lights = create_lights_from_spec(pt_entry["light_spec"])
+            bproc.renderer.set_max_amount_of_samples(args.samples)
 
-    # ── SUN lights, no shadows ────────────────────────────────────────────
-    sun_results = []
-    for light_idx in range(args.num_light_setups):
-        sun_spec, sun_brightness, sun_attempts, sun_accepted, sun_lights = \
-            render_light_condition(sample_sun_light_setup, use_shadow_for_preview=False)
-        set_shadow(sun_lights, False)
-        bproc.renderer.set_max_amount_of_samples(args.samples)
-        sun_data = bproc.renderer.render(load_keys={"colors"})
-        save_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.png"))
-        save_srgb_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}_srgb.png"))
-        save_exr(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.exr"))
-        for l in sun_lights:
-            l.delete()
-        status = "accepted" if sun_accepted else f"gave up after {sun_attempts} attempt(s)"
-        print(f"view {view_idx} sun[{light_idx}]: brightness={sun_brightness:.3f} ({status})")
-        sun_results.append({
-            "light_spec": sun_spec, "brightness": sun_brightness,
-            "attempts": sun_attempts, "accepted": sun_accepted,
-        })
+            set_shadow(pt_lights, True)
+            pt_shadow_data = bproc.renderer.render(load_keys={"colors"})
+            save_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.png"))
+            save_srgb_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}_srgb.png"))
+            save_exr(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.exr"))
 
-    view_manifest["sun"] = sun_results
+            set_shadow(pt_lights, False)
+            pt_noshadow_data = bproc.renderer.render(load_keys={"colors"})
+            save_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.png"))
+            save_srgb_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}_srgb.png"))
+            save_exr(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.exr"))
 
-    # ── POINT lights — paired shadow / no-shadow ──────────────────────────
-    pt_results = []
-    for light_idx in range(args.num_light_setups):
-        pt_spec, pt_brightness, pt_attempts, pt_accepted, pt_lights = \
-            render_light_condition(sample_point_light_setup, use_shadow_for_preview=True)
-        bproc.renderer.set_max_amount_of_samples(args.samples)
+            for l in pt_lights:
+                l.delete()
+            print(f"view {view_idx} point[{light_idx}]: re-rendered "
+                  f"(stored brightness={pt_entry['brightness']:.3f})")
 
-        set_shadow(pt_lights, True)
-        pt_shadow_data = bproc.renderer.render(load_keys={"colors"})
-        save_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.png"))
-        save_srgb_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}_srgb.png"))
-        save_exr(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.exr"))
+        print(f"View {view_idx} done -> {view_dir}")
 
-        set_shadow(pt_lights, False)
-        pt_noshadow_data = bproc.renderer.render(load_keys={"colors"})
-        save_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.png"))
-        save_srgb_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}_srgb.png"))
-        save_exr(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.exr"))
+    print("\nDone (re-render mode).")
+    print(f"Re-rendered {len(_setups)} view(s) -> {scene_dir}")
 
-        for l in pt_lights:
-            l.delete()
-        status = "accepted" if pt_accepted else f"gave up after {pt_attempts} attempt(s)"
-        print(f"view {view_idx} point[{light_idx}]: brightness={pt_brightness:.3f} ({status})")
-        pt_results.append({
-            "light_spec": pt_spec, "brightness": pt_brightness,
-            "attempts": pt_attempts, "accepted": pt_accepted,
-        })
+else:
+    # ── Normal sampling mode ──────────────────────────────────────────────
+    manifest: dict = {}
+    accepted_setups: dict = {}
 
-    view_manifest["point"] = pt_results
+    for view_idx in range(args.num_camera_poses):
+        view_dir = os.path.join(scene_dir, str(view_idx))
+        os.makedirs(view_dir, exist_ok=True)
 
-    manifest[str(view_idx)] = view_manifest
+        # ── Camera pose (retry if G-buffer is too uniform) ────────────────
+        cam2world_matrix = None
+        view_tries = 0
+        view_ok = False
+        roughness_std = metallic_std = None
+        while not view_ok and view_tries < args.max_view_retries:
+            view_tries += 1
+            cam2world_matrix = sample_camera_pose()
+            bproc.utility.reset_keyframes()
+            bproc.camera.add_camera_pose(cam2world_matrix)
+            capture_gbuffers_for_view(view_dir, cam2world_matrix)
+            view_ok, roughness_std, metallic_std = gbuffer_variation_ok(view_dir, args.min_material_std)
+            if not view_ok:
+                print(f"view {view_idx}: gbuffer too 'boring' (roughness_std={roughness_std:.4f}, "
+                      f"metallic_std={metallic_std:.4f}, attempt {view_tries}) - resampling")
 
-    sun_accepted_list = [r for r in sun_results if r["accepted"]]
-    pt_accepted_list  = [r for r in pt_results  if r["accepted"]]
-    if sun_accepted_list and pt_accepted_list and cam2world_matrix is not None:
-        accepted_setups[str(view_idx)] = {
-            "cam2world": cam2world_matrix.tolist(),
-            "sun":   [{"light_spec": r["light_spec"], "brightness": r["brightness"]}
-                      for r in sun_accepted_list],
-            "point": [{"light_spec": r["light_spec"], "brightness": r["brightness"]}
-                      for r in pt_accepted_list],
+        view_status = "accepted" if view_ok else f"gave up after {view_tries} attempt(s), kept last"
+        print(f"view {view_idx}: roughness_std={roughness_std:.4f}, metallic_std={metallic_std:.4f} ({view_status})")
+
+        view_manifest: dict = {
+            "_view": {
+                "tries": view_tries,
+                "accepted": view_ok,
+                "roughness_std": roughness_std,
+                "metallic_std": metallic_std,
+            }
         }
 
-    print(f"View {view_idx}/{args.num_camera_poses - 1} done -> {view_dir}")
+        # ── SUN lights, no shadows ────────────────────────────────────────
+        sun_results = []
+        for light_idx in range(args.num_light_setups):
+            sun_spec, sun_brightness, sun_attempts, sun_accepted, sun_lights = \
+                render_light_condition(sample_sun_light_setup, use_shadow_for_preview=False)
+            set_shadow(sun_lights, False)
+            bproc.renderer.set_max_amount_of_samples(args.samples)
+            sun_data = bproc.renderer.render(load_keys={"colors"})
+            save_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.png"))
+            save_srgb_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}_srgb.png"))
+            save_exr(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.exr"))
+            for l in sun_lights:
+                l.delete()
+            status = "accepted" if sun_accepted else f"gave up after {sun_attempts} attempt(s)"
+            print(f"view {view_idx} sun[{light_idx}]: brightness={sun_brightness:.3f} ({status})")
+            sun_results.append({
+                "light_spec": sun_spec, "brightness": sun_brightness,
+                "attempts": sun_attempts, "accepted": sun_accepted,
+            })
 
-manifest_path = os.path.join(scene_dir, "light_conditions.json")
-with open(manifest_path, "w", encoding="utf-8") as f:
-    json.dump(manifest, f, indent=2)
+        view_manifest["sun"] = sun_results
 
-accepted_path = os.path.join(scene_dir, "accepted_setups.json")
-with open(accepted_path, "w", encoding="utf-8") as f:
-    json.dump(accepted_setups, f, indent=2)
+        # ── POINT lights — paired shadow / no-shadow ──────────────────────
+        pt_results = []
+        for light_idx in range(args.num_light_setups):
+            pt_spec, pt_brightness, pt_attempts, pt_accepted, pt_lights = \
+                render_light_condition(sample_point_light_setup, use_shadow_for_preview=True)
+            bproc.renderer.set_max_amount_of_samples(args.samples)
 
-print("\nDone.")
-print(f"{args.num_camera_poses} view(s), 3 renders each "
-      f"(sun / point_shadow / point_no_shadow) = "
-      f"{args.num_camera_poses * 3} total renderings")
-print(f"Accepted setups: {len(accepted_setups)}/{args.num_camera_poses} views "
-      f"-> {accepted_path}")
-print(f"Output: {scene_dir}/<cam_nr>/{{albedo,normals,roughness,metallic,"
-      f"sun,point_shadow,point_no_shadow}}.{{png,exr}}")
-print("Light condition manifest:", manifest_path)
+            set_shadow(pt_lights, True)
+            pt_shadow_data = bproc.renderer.render(load_keys={"colors"})
+            save_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.png"))
+            save_srgb_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}_srgb.png"))
+            save_exr(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.exr"))
+
+            set_shadow(pt_lights, False)
+            pt_noshadow_data = bproc.renderer.render(load_keys={"colors"})
+            save_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.png"))
+            save_srgb_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}_srgb.png"))
+            save_exr(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.exr"))
+
+            for l in pt_lights:
+                l.delete()
+            status = "accepted" if pt_accepted else f"gave up after {pt_attempts} attempt(s)"
+            print(f"view {view_idx} point[{light_idx}]: brightness={pt_brightness:.3f} ({status})")
+            pt_results.append({
+                "light_spec": pt_spec, "brightness": pt_brightness,
+                "attempts": pt_attempts, "accepted": pt_accepted,
+            })
+
+        view_manifest["point"] = pt_results
+
+        manifest[str(view_idx)] = view_manifest
+
+        sun_accepted_list = [r for r in sun_results if r["accepted"]]
+        pt_accepted_list  = [r for r in pt_results  if r["accepted"]]
+        if sun_accepted_list and pt_accepted_list and cam2world_matrix is not None:
+            accepted_setups[str(view_idx)] = {
+                "cam2world": cam2world_matrix.tolist(),
+                "sun":   [{"light_spec": r["light_spec"], "brightness": r["brightness"]}
+                          for r in sun_accepted_list],
+                "point": [{"light_spec": r["light_spec"], "brightness": r["brightness"]}
+                          for r in pt_accepted_list],
+            }
+
+        print(f"View {view_idx}/{args.num_camera_poses - 1} done -> {view_dir}")
+
+    manifest_path = os.path.join(scene_dir, "light_conditions.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    accepted_path = os.path.join(scene_dir, "accepted_setups.json")
+    with open(accepted_path, "w", encoding="utf-8") as f:
+        json.dump(accepted_setups, f, indent=2)
+
+    print("\nDone.")
+    print(f"{args.num_camera_poses} view(s), {args.num_light_setups} light setups each "
+          f"-> {args.num_camera_poses * args.num_light_setups * 3} total renderings")
+    print(f"Accepted setups: {len(accepted_setups)}/{args.num_camera_poses} views "
+          f"-> {accepted_path}")
+    print(f"Output: {scene_dir}/<cam_nr>/{{albedo,normals,roughness,metallic,"
+          f"sun,point_shadow,point_no_shadow}}_*.{{png,exr}}")
+    print("Light condition manifest:", manifest_path)
