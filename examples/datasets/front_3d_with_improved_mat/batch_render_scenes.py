@@ -74,10 +74,10 @@ parser.add_argument("--inspect_script", default="inspect_materials.py",
                      help="Path to inspect_materials.py")
 parser.add_argument("--render_script", default="render_front3d_multipass.py",
                      help="Path to render_front3d_multipass.py")
-parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True,
+parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=False,
                      help="Shuffle scene order before checking (default True), so repeated "
                           "runs don't always re-examine the same alphabetically-first scenes")
-parser.add_argument("--seed", type=int, default=None, help="Random seed for --shuffle")
+parser.add_argument("--seed", type=int, default=42, help="Random seed for --shuffle")
 args, extra_render_args = parser.parse_known_args()
 
 if args.cc_material_path and args.cc_material_path.strip().lower() in ("none", ""):

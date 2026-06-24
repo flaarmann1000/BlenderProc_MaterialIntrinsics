@@ -51,7 +51,7 @@ bpy.context.scene.render.use_multiview = False
 # ── Material constants ────────────────────────────────────────────────────────
 ALBEDO    = (0.7, 0.3, 0.3)
 METALLIC  = 0.5
-ROUGHNESS = 0.7
+ROUGHNESS = 0.3
 
 # ── Sphere ────────────────────────────────────────────────────────────────────
 bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(0, 0, 0),

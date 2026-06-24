@@ -142,7 +142,7 @@ parser.add_argument("--brightness_min", type=float, default=0.3,
                      help="Minimum acceptable average image brightness (0-1 luminance)")
 parser.add_argument("--brightness_max", type=float, default=0.7,
                      help="Maximum acceptable average image brightness (0-1 luminance)")
-parser.add_argument("--max_light_retries", type=int, default=15,
+parser.add_argument("--max_light_retries", type=int, default=100,
                      help="Max attempts to find a light condition within the brightness range "
                           "for a given (view, light slot) before giving up and keeping the "
                           "last attempt anyway")
@@ -151,14 +151,22 @@ parser.add_argument("--min_material_std", type=float, default=0.01,
                           "roughness and metallic G-buffer maps for a view to be kept - a value "
                           "below this on either map means that map is essentially flat/uniform "
                           "('boring') across the whole view, e.g. a close-up of a single material.")
+parser.add_argument("--min_albedo_std", type=float, default=0.05,
+                     help="Minimum standard deviation (0-1 normalized) of the albedo map for a "
+                          "view to be kept. Low values indicate the view is dominated by a single "
+                          "colour (e.g. a white wall close-up). Computed across all RGB channels.")
+parser.add_argument("--min_normals_std", type=float, default=0.05,
+                     help="Minimum standard deviation (0-1 normalized) of the camera-space normal "
+                          "map for a view to be kept. Low values indicate an essentially flat "
+                          "surface fills the frame (few distinct surface orientations).")
 parser.add_argument("--max_view_retries", type=int, default=10,
-                     help="Max attempts to find a camera pose whose G-buffer isn't 'boring' "
-                          "(see --min_material_std) before giving up and keeping the last "
-                          "attempt anyway")
+                     help="Max attempts to find a camera pose whose G-buffers pass all diversity "
+                          "checks (--min_material_std / --min_albedo_std / --min_normals_std) "
+                          "before giving up and skipping that view slot entirely.")
 parser.add_argument("--samples", type=int, default=512,
                      help="Max Cycles samples per pixel for FINAL/accepted renderings "
                           "(BlenderProc's own default is 1024 - this lowers it for speed).")
-parser.add_argument("--preview_samples", type=int, default=10,
+parser.add_argument("--preview_samples", type=int, default=100,
                      help="Max Cycles samples per pixel used while testing whether a candidate "
                           "lighting condition falls in the target brightness range. Kept low "
                           "since these are throwaway checks - only the final accepted render "
@@ -166,12 +174,11 @@ parser.add_argument("--preview_samples", type=int, default=10,
                           "re-rendered at --samples quality.")
 parser.add_argument("--accepted_setups", default=None,
                      help="Path to an accepted_setups.json produced by a previous run of this "
-                          "script. When given, the scene is loaded identically but all camera "
-                          "sampling / gbuffer checks / brightness checks are skipped: only the "
-                          "exact camera poses and light specs recorded in the JSON are used. "
-                          "scene_dir is inferred from the JSON file's parent directory, so "
-                          "--output_dir is ignored. The neighbouring light_conditions.json is "
-                          "left untouched.")
+                          "script. When given, all camera sampling / gbuffer checks / brightness "
+                          "checks are skipped: only the exact camera poses and light specs "
+                          "recorded in the JSON are used. Output still goes to "
+                          "<output_dir>/<scene_id>/ as normal. The existing "
+                          "light_conditions.json in that folder is left untouched.")
 args = parser.parse_args()
 
 if args.cc_material_path and args.cc_material_path.strip().lower() in ("none", ""):
@@ -498,14 +505,10 @@ def transform_normals_to_camera_space(view_dir, cam2world_matrix):
 setup_material_aovs()
 
 scene_id = os.path.splitext(os.path.basename(args.front_json))[0]
-if args.accepted_setups:
-    # Re-render mode: scene_dir is where the JSON lives; never delete it.
-    scene_dir = os.path.dirname(os.path.abspath(args.accepted_setups))
-else:
-    scene_dir = os.path.join(args.output_dir, scene_id)
-    if args.overwrite and os.path.exists(scene_dir):
-        print(f"--overwrite is set: removing existing {scene_dir}")
-        shutil.rmtree(scene_dir)
+scene_dir = os.path.join(args.output_dir, scene_id)
+if not args.accepted_setups and args.overwrite and os.path.exists(scene_dir):
+    print(f"--overwrite is set: removing existing {scene_dir}")
+    shutil.rmtree(scene_dir)
 os.makedirs(scene_dir, exist_ok=True)
 print(f"Writing output to: {scene_dir}")
 
@@ -709,14 +712,16 @@ def channel_std(view_dir, channel):
     return float((arr / max_val).std())
 
 
-def gbuffer_variation_ok(view_dir, min_std):
-    """Rejects a view whose roughness or metallic map is essentially flat
-    across the whole frame (e.g. a close-up of a single material) - such a
-    view carries little useful material information."""
+def gbuffer_variation_ok(view_dir, min_std, min_albedo_std, min_normals_std):
+    """Rejects a view whose G-buffers are essentially flat / boring.
+    Checks roughness, metallic, albedo (RGB), and camera-space normals."""
     roughness_std = channel_std(view_dir, "roughness")
-    metallic_std = channel_std(view_dir, "metallic")
-    ok = roughness_std >= min_std and metallic_std >= min_std
-    return ok, roughness_std, metallic_std
+    metallic_std  = channel_std(view_dir, "metallic")
+    albedo_std    = channel_std(view_dir, "albedo")
+    normals_std   = channel_std(view_dir, "normals")
+    ok = (roughness_std >= min_std and metallic_std >= min_std
+          and albedo_std >= min_albedo_std and normals_std >= min_normals_std)
+    return ok, roughness_std, metallic_std, albedo_std, normals_std
 
 
 # ---------------------------------------------------------------------------
@@ -814,31 +819,42 @@ else:
         view_dir = os.path.join(scene_dir, str(view_idx))
         os.makedirs(view_dir, exist_ok=True)
 
-        # ── Camera pose (retry if G-buffer is too uniform) ────────────────
+        # ── Camera pose (retry if G-buffer is too uniform / boring) ──────────
         cam2world_matrix = None
         view_tries = 0
         view_ok = False
-        roughness_std = metallic_std = None
+        roughness_std = metallic_std = albedo_std = normals_std = None
         while not view_ok and view_tries < args.max_view_retries:
             view_tries += 1
             cam2world_matrix = sample_camera_pose()
             bproc.utility.reset_keyframes()
             bproc.camera.add_camera_pose(cam2world_matrix)
             capture_gbuffers_for_view(view_dir, cam2world_matrix)
-            view_ok, roughness_std, metallic_std = gbuffer_variation_ok(view_dir, args.min_material_std)
+            view_ok, roughness_std, metallic_std, albedo_std, normals_std = \
+                gbuffer_variation_ok(view_dir, args.min_material_std,
+                                     args.min_albedo_std, args.min_normals_std)
             if not view_ok:
-                print(f"view {view_idx}: gbuffer too 'boring' (roughness_std={roughness_std:.4f}, "
-                      f"metallic_std={metallic_std:.4f}, attempt {view_tries}) - resampling")
+                print(f"view {view_idx}: gbuffer too 'boring' "
+                      f"(roughness={roughness_std:.4f}, metallic={metallic_std:.4f}, "
+                      f"albedo={albedo_std:.4f}, normals={normals_std:.4f}, "
+                      f"attempt {view_tries}) - resampling")
 
-        view_status = "accepted" if view_ok else f"gave up after {view_tries} attempt(s), kept last"
-        print(f"view {view_idx}: roughness_std={roughness_std:.4f}, metallic_std={metallic_std:.4f} ({view_status})")
+        if not view_ok:
+            print(f"view {view_idx}: no interesting pose found after {view_tries} attempt(s) - skipping")
+            shutil.rmtree(view_dir, ignore_errors=True)
+            continue
+
+        print(f"view {view_idx}: roughness={roughness_std:.4f}  metallic={metallic_std:.4f}  "
+              f"albedo={albedo_std:.4f}  normals={normals_std:.4f}  (accepted)")
 
         view_manifest: dict = {
             "_view": {
                 "tries": view_tries,
                 "accepted": view_ok,
                 "roughness_std": roughness_std,
-                "metallic_std": metallic_std,
+                "metallic_std":  metallic_std,
+                "albedo_std":    albedo_std,
+                "normals_std":   normals_std,
             }
         }
 
