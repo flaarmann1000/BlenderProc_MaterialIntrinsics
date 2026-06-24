@@ -353,6 +353,8 @@ def setup_material_aovs():
         bsdf = find_top_level_principled_bsdf(mat.node_tree)
         if bsdf is None:
             continue
+        
+        bsdf.distribution = 'GGX'   # disable multi-scatter compensation
 
         for input_name in ("Roughness", "Metallic"):
             socket = bsdf.inputs[input_name]

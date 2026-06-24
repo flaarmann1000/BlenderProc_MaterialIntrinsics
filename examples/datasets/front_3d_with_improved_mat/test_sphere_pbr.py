@@ -67,6 +67,7 @@ bsdf = nodes_mat["Principled BSDF"]
 bsdf.inputs["Base Color"].default_value = (*ALBEDO, 1.0)
 bsdf.inputs["Metallic"].default_value   = METALLIC
 bsdf.inputs["Roughness"].default_value  = ROUGHNESS
+bsdf.distribution = 'GGX'   # disable multi-scatter compensation
 sphere_obj.data.materials.append(mat)
 
 # ── Material AOVs (albedo + roughness + metallic) ────────────────────────────
