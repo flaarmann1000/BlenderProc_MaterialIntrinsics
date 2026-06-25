@@ -34,8 +34,17 @@ from blenderproc.python.utility.Utility import Utility
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 import argparse
+_DEFAULT_ENV_MAP = (
+    r"C:\Users\felix\Documents\intrinsic decomposition\results\3dfront-sphere-render-az45-el45\sh_env_map.png"
+)
 parser = argparse.ArgumentParser()
 parser.add_argument("output_dir", nargs="?", default="output_sphere_pbr")
+parser.add_argument("--env_map", nargs="?", const=_DEFAULT_ENV_MAP, default=None,
+                    metavar="PATH",
+                    help="Use an env map instead of the SUN light. "
+                         "Pass without a value to use the default sh_env_map_000.png, "
+                         "or supply an explicit path.")
+parser.add_argument("--env_map_strength", type=float, default=2.0)
 args = parser.parse_args()
 output_dir = os.path.abspath(args.output_dir)
 os.makedirs(output_dir, exist_ok=True)
@@ -113,21 +122,59 @@ cam2world[:3, :3] = R
 cam2world[:3,  3] = cam_pos
 bproc.camera.add_camera_pose(cam2world)
 
-# ── SUN light ────────────────────────────────────────────────────────────────
-# Azimuth 45° to the right of camera axis (+Y) → horizontal direction (0.707, 0.707, 0).
-# Elevation 45° above horizontal.
-# Combined sun_from = (0.5, 0.5, 0.707), light travels toward (-0.5, -0.5, -0.707).
-#
-# Blender SUN shines along lamp local -Z. We need lamp -Z = (-0.5, -0.5, -0.707).
-# With Blender XYZ Euler (rx, ry, rz):  lamp -Z = (-sin(rz)*sin(rx),  cos(rz)*sin(rx), -cos(rx))
-# Solving: rx = 45° (π/4),  ry = 0,  rz = 135° (3π/4).
-sun_data = bpy.data.lights.new("sun", "SUN")
-sun_data.color   = (1.0, 1.0, 1.0)
-sun_data.energy  = 5.0
-sun_obj = bpy.data.objects.new("sun", sun_data)
-bpy.context.scene.collection.objects.link(sun_obj)
-# sun_obj.rotation_euler = (math.pi / 4, 0.0, 3 * math.pi / 4)
-sun_obj.rotation_euler = (math.pi/4,0.0,math.pi / 4)
+# ── Lighting ─────────────────────────────────────────────────────────────────
+if args.env_map:
+    env_world = bpy.data.worlds.new("env_world")
+    env_world.use_nodes = True
+    wn = env_world.node_tree.nodes
+    wl = env_world.node_tree.links
+    wn.clear()
+
+    env_img = bpy.data.images.load(os.path.abspath(args.env_map))
+    tex = wn.new("ShaderNodeTexEnvironment")
+    tex.image = env_img
+
+    geom      = wn.new("ShaderNodeNewGeometry")
+    vec_xform = wn.new("ShaderNodeVectorTransform")
+    vec_xform.vector_type  = "VECTOR"
+    vec_xform.convert_from = "WORLD"
+    vec_xform.convert_to   = "CAMERA"
+
+    bg  = wn.new("ShaderNodeBackground")
+    bg.inputs["Strength"].default_value = args.env_map_strength
+    out = wn.new("ShaderNodeOutputWorld")
+
+    sep  = wn.new("ShaderNodeSeparateXYZ")
+    negx = wn.new("ShaderNodeMath"); negx.operation = "MULTIPLY"; negx.inputs[1].default_value = -1.0
+    negz = wn.new("ShaderNodeMath"); negz.operation = "MULTIPLY"; negz.inputs[1].default_value = -1.0
+    negy = wn.new("ShaderNodeMath"); negy.operation = "MULTIPLY"; negy.inputs[1].default_value = -1.0
+    comb = wn.new("ShaderNodeCombineXYZ")
+
+    wl.new(geom.outputs["Incoming"],    vec_xform.inputs["Vector"])
+    wl.new(vec_xform.outputs["Vector"], sep.inputs["Vector"])
+    wl.new(sep.outputs["X"],            negx.inputs[0])
+    wl.new(sep.outputs["Z"],            negz.inputs[0])
+    wl.new(sep.outputs["Y"],            negy.inputs[0])
+    wl.new(negx.outputs["Value"],       comb.inputs["X"])   # X' = -x
+    wl.new(negz.outputs["Value"],       comb.inputs["Y"])   # Y' = -z
+    wl.new(negy.outputs["Value"],       comb.inputs["Z"])   # Z' = -y
+    wl.new(comb.outputs["Vector"],      tex.inputs["Vector"])
+    wl.new(tex.outputs["Color"],        bg.inputs["Color"])
+    wl.new(bg.outputs["Background"],    out.inputs["Surface"])
+
+    bpy.context.scene.world = env_world
+    print(f"Lighting: env map  {args.env_map}  strength={args.env_map_strength}")
+
+else:
+    # SUN light — 45° azimuth right of camera axis, 45° elevation.
+    # Blender SUN shines along lamp local -Z; rx=π/4, ry=0, rz=π/4.
+    sun_data = bpy.data.lights.new("sun", "SUN")
+    sun_data.color  = (1.0, 1.0, 1.0)
+    sun_data.energy = 5.0
+    sun_obj = bpy.data.objects.new("sun", sun_data)
+    bpy.context.scene.collection.objects.link(sun_obj)
+    sun_obj.rotation_euler = (math.pi / 4, 0.0, math.pi / 4)
+    print("Lighting: SUN light")
 
 # ── Helper: save functions ────────────────────────────────────────────────────
 def _to_linear_float(arr):

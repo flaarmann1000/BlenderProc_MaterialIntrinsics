@@ -188,7 +188,7 @@ parser.add_argument("--disk_light_distance", type=float, default=20.0,
                           "light is placed. The disk is then oriented to face the camera. "
                           "Default: 20.")
 parser.add_argument("--env_map_dir",
-                     default=r"C:\Users\felix\Documents\intrinsic decomposition\results\3dfront-dataset-sh",
+                     default=r"C:\Users\felix\Documents\intrinsic decomposition\results\ref_sh_lighting",
                      help="Folder containing env map PNGs named sh_env_map_NNN.png, used when "
                           "'env' is listed in --light_conditions. Files are cycled in sorted "
                           "order across the num_light_setups slots.")
@@ -207,6 +207,32 @@ if args.cc_material_path and args.cc_material_path.strip().lower() in ("none", "
     args.cc_material_path = None
 if args.metal_material_list and args.metal_material_list.strip().lower() in ("none", ""):
     args.metal_material_list = None
+
+# When re-rendering, derive front_json from the accepted_setups path so the
+# correct scene is loaded without the user having to pass it explicitly.
+# accepted_setups.json lives at <scene_dir>/accepted_setups.json  (whole-scene)
+# or at <scene_dir>/<view_idx>/accepted_setup.json               (per-view).
+if args.accepted_setups:
+    _accepted_abs = os.path.abspath(args.accepted_setups)
+    _fname = os.path.basename(_accepted_abs)
+    if _fname == "accepted_setups.json":
+        _derived_scene_id = os.path.basename(os.path.dirname(_accepted_abs))
+    else:
+        # per-view: parent is <view_idx>/, grandparent is <scene_dir>/
+        _derived_scene_id = os.path.basename(
+            os.path.dirname(os.path.dirname(_accepted_abs))
+        )
+    _front_json_dir = os.path.dirname(os.path.abspath(args.front_json))
+    _derived_front_json = os.path.join(_front_json_dir, _derived_scene_id + ".json")
+    if not os.path.exists(_derived_front_json):
+        raise SystemExit(
+            f"Cannot find 3D-FRONT JSON for scene '{_derived_scene_id}': "
+            f"{_derived_front_json}\n"
+            f"Pass the correct front_json positional argument explicitly if "
+            f"the scene files are in a different directory."
+        )
+    args.front_json = _derived_front_json
+    print(f"Re-render mode: using scene {_derived_scene_id}")
 
 # Resolve every path argument to an absolute path *now*, before bproc.init()
 # or scene loading run - Blender/BlenderProc can change the process's
@@ -814,6 +840,7 @@ def _set_mesh_shadow_visibility(enabled: bool) -> None:
             obj.cycles_visibility.shadow = enabled
 
 
+
 def _apply_world_spec(spec):
     """Replace the scene World with an env-map background from spec['path']
     and disable all mesh shadow casting so the render is shadow-free.
@@ -831,12 +858,30 @@ def _apply_world_spec(spec):
     tex = nodes.new("ShaderNodeTexEnvironment")
     tex.image = img
 
+    # Transform incoming ray direction from world space → camera space so the
+    # env map is locked to the camera's view rather than to world orientation.
+    sep  = nodes.new("ShaderNodeSeparateXYZ")
+    negz = nodes.new("ShaderNodeMath"); negz.operation = "MULTIPLY"; negz.inputs[1].default_value = -1.0
+    comb = nodes.new("ShaderNodeCombineXYZ")    
+    
+    geom      = nodes.new("ShaderNodeNewGeometry")
+    vec_xform = nodes.new("ShaderNodeVectorTransform")
+    vec_xform.vector_type  = "VECTOR"
+    vec_xform.convert_from = "WORLD"
+    vec_xform.convert_to   = "CAMERA"
+
     bg = nodes.new("ShaderNodeBackground")
     bg.inputs["Strength"].default_value = spec["strength"]
+    out = nodes.new("ShaderNodeOutputWorld")    
 
-    out = nodes.new("ShaderNodeOutputWorld")
-
-    links.new(tex.outputs["Color"], bg.inputs["Color"])
+    links.new(geom.outputs["Incoming"],    vec_xform.inputs["Vector"])
+    links.new(vec_xform.outputs["Vector"], sep.inputs["Vector"])
+    links.new(sep.outputs["Z"], negz.inputs[0])
+    links.new(sep.outputs["X"], comb.inputs["X"])   # X' =  x
+    links.new(negz.outputs["Value"], comb.inputs["Y"])  # Y' = -z
+    links.new(sep.outputs["Y"], comb.inputs["Z"])   # Z' =  y
+    links.new(comb.outputs["Vector"], tex.inputs["Vector"])
+    links.new(tex.outputs["Color"],   bg.inputs["Color"])
     links.new(bg.outputs["Background"], out.inputs["Surface"])
 
     world.cycles_visibility.shadow = False
@@ -917,10 +962,26 @@ def render_light_condition(sampler, use_shadow_for_preview):
     return light_spec, brightness, attempt, accepted, created_lights
 
 
+def _load_accepted_setups(path: str) -> dict:
+    """Load an accepted-setups JSON and normalise to {view_key: setup_dict}.
+
+    Two formats are supported:
+      • whole-scene  – keys are string view indices, value is a setup dict
+                       (the file written to <scene_dir>/accepted_setups.json)
+      • per-view     – 'cam2world' at the top level; a single-view file
+                       (written to <scene_dir>/<view_idx>/accepted_setup.json)
+                       The view key is derived from the parent directory name."""
+    with open(path, encoding="utf-8") as _f:
+        data = json.load(_f)
+    if "cam2world" in data:
+        view_key = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        return {view_key: data}
+    return data
+
+
 if args.accepted_setups:
     # ── Re-render from accepted_setups.json ──────────────────────────────────
-    with open(args.accepted_setups, encoding="utf-8") as _f:
-        _setups = json.load(_f)
+    _setups = _load_accepted_setups(args.accepted_setups)
     print(f"Re-render mode: {len(_setups)} view(s) from {args.accepted_setups}")
 
     for _view_key, _setup in _setups.items():
@@ -939,6 +1000,8 @@ if args.accepted_setups:
             "disk":  lambda: sample_disk_light_setup(cam_pos),
             "point": sample_point_light_setup,
         }
+
+        _rendered_setup: dict = {"cam2world": cam2world_matrix.tolist()}
 
         # Drive from --light_conditions so conditions absent from the JSON
         # are freshly sampled, while conditions already stored are replayed.
@@ -973,9 +1036,11 @@ if args.accepted_setups:
                             l.delete()
                     print(f"view {view_idx} {cond_name}[{light_idx}]: re-rendered "
                           f"(stored brightness={entry['brightness']:.3f})")
+                _rendered_setup[cond_name] = list(_setup[cond_name])
             else:
                 # ── Generate fresh setups for this condition ───────────────
                 shadow_prev = _CONDITION_SHADOW_PREVIEW[cond_name]
+                fresh_entries = []
                 for light_idx in range(args.num_light_setups):
                     old_world = tmp_world = tmp_img = None
                     lights = []
@@ -1007,7 +1072,18 @@ if args.accepted_setups:
                     status = "accepted" if accepted else f"gave up after {attempts} attempt(s)"
                     print(f"view {view_idx} {cond_name}[{light_idx}]: "
                           f"brightness={brightness:.3f} ({status}) [new]")
+                    fresh_entries.append({"light_spec": spec, "brightness": brightness,
+                                          "accepted": accepted})
+                accepted_fresh = [
+                    {"light_spec": e["light_spec"], "brightness": e["brightness"]}
+                    for e in fresh_entries if e["accepted"]
+                ]
+                if accepted_fresh:
+                    _rendered_setup[cond_name] = accepted_fresh
 
+        per_view_path = os.path.join(view_dir, "accepted_setup.json")
+        with open(per_view_path, "w", encoding="utf-8") as f:
+            json.dump(_rendered_setup, f, indent=2)
         print(f"View {view_idx} done -> {view_dir}")
 
     print("\nDone (re-render mode).")
@@ -1133,6 +1209,9 @@ else:
                 "cam2world": cam2world_matrix.tolist(),
                 **cond_accepted,
             }
+            per_view_path = os.path.join(view_dir, "accepted_setup.json")
+            with open(per_view_path, "w", encoding="utf-8") as f:
+                json.dump(accepted_setups[str(view_idx)], f, indent=2)
 
         print(f"View {view_idx}/{args.num_camera_poses - 1} done -> {view_dir}")
 
