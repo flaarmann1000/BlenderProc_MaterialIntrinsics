@@ -83,13 +83,16 @@ Usage:
 
 import argparse
 import colorsys
+import glob
 import json
+import math
 import os
 import random
 import re
 import shutil
 
 import bpy
+import mathutils
 import numpy as np
 from PIL import Image
 
@@ -109,7 +112,7 @@ parser.add_argument("future_folder", nargs="?",
 parser.add_argument("front_texture", nargs="?",
                      default=r"E:\3D-Front\3D-FRONT-texture",
                      help="Path to the 3D-FRONT-texture folder")
-parser.add_argument("output_dir", nargs="?", default="output",
+parser.add_argument("output_dir", nargs="?", default=r"E:\3D-Front\output",
                      help="Where to write the dataset")
 parser.add_argument("--cc_material_path", default=r"E:\3D-Front\cctextures",
                      help="Path to a cctextures folder for floor/wall PBR materials. "
@@ -172,6 +175,25 @@ parser.add_argument("--preview_samples", type=int, default=100,
                           "since these are throwaway checks - only the final accepted render "
                           "(or the last attempt, if --max_light_retries is exhausted) is "
                           "re-rendered at --samples quality.")
+parser.add_argument("--light_conditions", nargs="+",
+                     default=["disk", "point"],
+                     choices=["sun", "disk", "point", "env"],
+                     help="Which lighting condition types to render per view. 'sun' = 1-3 SUN "
+                          "directional lights (no shadows); 'disk' = 3 large AREA/DISK lights "
+                          "aimed at the camera from random sphere angles (no shadows); "
+                          "'point' = 1-3 POINT lights rendered twice (shadow + no-shadow). "
+                          "Default: disk point. sun code is kept but skipped unless listed.")
+parser.add_argument("--disk_light_distance", type=float, default=20.0,
+                     help="Distance (metres) from the camera position at which each disk area "
+                          "light is placed. The disk is then oriented to face the camera. "
+                          "Default: 20.")
+parser.add_argument("--env_map_dir",
+                     default=r"C:\Users\felix\Documents\intrinsic decomposition\results\3dfront-dataset-sh",
+                     help="Folder containing env map PNGs named sh_env_map_NNN.png, used when "
+                          "'env' is listed in --light_conditions. Files are cycled in sorted "
+                          "order across the num_light_setups slots.")
+parser.add_argument("--env_map_strength", type=float, default=1.0,
+                     help="Constant background strength applied to every env map. Default: 1.0.")
 parser.add_argument("--accepted_setups", default=None,
                      help="Path to an accepted_setups.json produced by a previous run of this "
                           "script. When given, all camera sampling / gbuffer checks / brightness "
@@ -200,6 +222,8 @@ if args.cc_material_path:
     args.cc_material_path = os.path.abspath(args.cc_material_path)
 if args.metal_material_list:
     args.metal_material_list = os.path.abspath(args.metal_material_list)
+if args.env_map_dir:
+    args.env_map_dir = os.path.abspath(args.env_map_dir)
 
 if args.seed is not None:
     random.seed(args.seed)
@@ -565,6 +589,19 @@ def capture_gbuffers_for_view(view_dir, cam2world_matrix):
 
 
 # ---------------------------------------------------------------------------
+# Env map file list (only populated when "env" is in --light_conditions).
+# Files are sorted so cycling is deterministic across runs.
+# ---------------------------------------------------------------------------
+env_map_paths: list[str] = []
+if "env" in args.light_conditions:
+    env_map_paths = sorted(glob.glob(os.path.join(args.env_map_dir, "sh_env_map_*.png")))
+    if not env_map_paths:
+        raise SystemExit(
+            f"No files matching 'sh_env_map_*.png' found in {args.env_map_dir}"
+        )
+    print(f"Found {len(env_map_paths)} env map file(s) in {args.env_map_dir}")
+
+# ---------------------------------------------------------------------------
 # Light samplers — one per type.  Colors use capped-saturation HSV to stay
 # plausible rather than garish.  SUN lights are directional (position is
 # irrelevant in Blender; only rotation matters).  POINT lights are placed
@@ -618,6 +655,65 @@ def sample_point_light_setup():
     ]
 
 
+def sample_disk_light_setup(cam_pos):
+    """3 large AREA/DISK lights placed on a sphere of radius disk_light_distance
+    around the camera, each aimed directly at the camera.  Angles are sampled
+    uniformly over the full sphere so lighting can come from any direction,
+    including below the horizon.  Shadows are always off for this condition."""
+    specs = []
+    for _ in range(3):
+        # Uniform sphere sampling: arccos gives correct area-weighting on elevation
+        phi   = math.acos(float(np.random.uniform(-1.0, 1.0)))  # [0, π]
+        theta = float(np.random.uniform(0.0, 2.0 * math.pi))
+        direction = np.array([
+            math.sin(phi) * math.cos(theta),
+            math.sin(phi) * math.sin(theta),
+            math.cos(phi),
+        ], dtype=np.float64)
+        light_pos = np.asarray(cam_pos, dtype=np.float64) + direction * args.disk_light_distance
+        # Orient disk so local -Z points toward the camera
+        toward_cam = mathutils.Vector((-direction).tolist())
+        euler = list(toward_cam.to_track_quat('-Z', 'Y').to_euler())
+        specs.append(dict(
+            type="AREA",
+            shape="DISK",
+            color=_random_color(),
+            location=light_pos.tolist(),
+            energy=float(np.random.uniform(100, 10000)),
+            size=float(np.random.uniform(3.0, 15.0)),
+            rotation_euler=euler,
+        ))
+    return specs
+
+
+# Maps each condition name → (stem_template, use_shadow) pairs to render.
+# stem_template uses {i} as the index placeholder.
+_CONDITION_RENDER_PAIRS = {
+    "sun":   [("sun_{i}",             False)],
+    "disk":  [("disk_{i}",            False)],
+    "point": [("point_shadow_{i}",    True),
+              ("point_no_shadow_{i}", False)],
+    "env":   [("env_{i}",             False)],
+}
+
+# Whether the brightness preview should be done with shadows on.
+_CONDITION_SHADOW_PREVIEW = {
+    "sun":   False,
+    "disk":  False,
+    "point": True,
+    "env":   False,
+}
+
+# "light" conditions are driven by bproc Light objects.
+# "world" conditions replace the scene World shader for each render.
+_CONDITION_BACKEND = {
+    "sun":   "light",
+    "disk":  "light",
+    "point": "light",
+    "env":   "world",
+}
+
+
 def create_lights_from_spec(light_specs):
     created = []
     for spec in light_specs:
@@ -628,6 +724,11 @@ def create_lights_from_spec(light_specs):
         if spec["type"] == "SUN":
             light.blender_obj.rotation_euler = spec["rotation_euler"]
             light.blender_obj.data.angle = spec["size"]
+        elif spec["type"] == "AREA":
+            light.set_location(spec["location"])
+            light.blender_obj.rotation_euler = spec["rotation_euler"]
+            light.blender_obj.data.shape = spec.get("shape", "DISK")
+            light.blender_obj.data.size = spec["size"]
         else:
             light.set_location(spec["location"])
             light.set_radius(spec["size"])
@@ -690,6 +791,67 @@ def save_srgb_png(arr, path):
                     12.92 * arr,
                     1.055 * arr ** (1.0 / 2.4) - 0.055)
     Image.fromarray((srgb * 255.0).astype(np.uint8)).save(path)
+
+
+def _save_beauty(arr, view_dir, stem):
+    """Write one beauty render as linear PNG, sRGB PNG, and EXR."""
+    save_png    (arr, os.path.join(view_dir, f"{stem}.png"))
+    save_srgb_png(arr, os.path.join(view_dir, f"{stem}_srgb.png"))
+    save_exr    (arr, os.path.join(view_dir, f"{stem}.exr"))
+
+
+def _set_mesh_shadow_visibility(enabled: bool) -> None:
+    """Enable or disable shadow casting/receiving on every mesh object.
+    Equivalent to set_shadow() for lights but applied to scene geometry,
+    so environment-map renders have no inter-object shadows."""
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        # Blender 3+ direct attribute; fall back to Cycles visibility struct.
+        if hasattr(obj, 'visible_shadow'):
+            obj.visible_shadow = enabled
+        elif hasattr(obj, 'cycles_visibility') and hasattr(obj.cycles_visibility, 'shadow'):
+            obj.cycles_visibility.shadow = enabled
+
+
+def _apply_world_spec(spec):
+    """Replace the scene World with an env-map background from spec['path']
+    and disable all mesh shadow casting so the render is shadow-free.
+    Returns (old_world, new_world, loaded_img) — pass all three to
+    _restore_world_spec() to undo the change."""
+    old_world = bpy.context.scene.world
+
+    world = bpy.data.worlds.new("_env_world")
+    world.use_nodes = True
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+    nodes.clear()
+
+    img = bpy.data.images.load(spec["path"])
+    tex = nodes.new("ShaderNodeTexEnvironment")
+    tex.image = img
+
+    bg = nodes.new("ShaderNodeBackground")
+    bg.inputs["Strength"].default_value = spec["strength"]
+
+    out = nodes.new("ShaderNodeOutputWorld")
+
+    links.new(tex.outputs["Color"], bg.inputs["Color"])
+    links.new(bg.outputs["Background"], out.inputs["Surface"])
+
+    world.cycles_visibility.shadow = False
+    bpy.context.scene.world = world
+    _set_mesh_shadow_visibility(False)
+    return old_world, world, img
+
+
+def _restore_world_spec(old_world, new_world, loaded_img):
+    """Undo _apply_world_spec: restore original world, free temp data,
+    and re-enable shadow casting on all mesh objects."""
+    _set_mesh_shadow_visibility(True)
+    bpy.context.scene.world = old_world
+    bpy.data.worlds.remove(new_world)
+    bpy.data.images.remove(loaded_img)
 
 
 def average_brightness(img):
@@ -771,39 +933,80 @@ if args.accepted_setups:
         bproc.camera.add_camera_pose(cam2world_matrix)
         capture_gbuffers_for_view(view_dir, cam2world_matrix)
 
-        for light_idx, sun_entry in enumerate(_setup["sun"]):
-            sun_lights = create_lights_from_spec(sun_entry["light_spec"])
-            set_shadow(sun_lights, False)
-            bproc.renderer.set_max_amount_of_samples(args.samples)
-            sun_data = bproc.renderer.render(load_keys={"colors"})
-            save_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.png"))
-            save_srgb_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}_srgb.png"))
-            save_exr(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.exr"))
-            for l in sun_lights:
-                l.delete()
-            print(f"view {view_idx} sun[{light_idx}]: re-rendered "
-                  f"(stored brightness={sun_entry['brightness']:.3f})")
+        cam_pos = cam2world_matrix[:3, 3].copy()
+        cond_samplers = {
+            "sun":   sample_sun_light_setup,
+            "disk":  lambda: sample_disk_light_setup(cam_pos),
+            "point": sample_point_light_setup,
+        }
 
-        for light_idx, pt_entry in enumerate(_setup["point"]):
-            pt_lights = create_lights_from_spec(pt_entry["light_spec"])
-            bproc.renderer.set_max_amount_of_samples(args.samples)
+        # Drive from --light_conditions so conditions absent from the JSON
+        # are freshly sampled, while conditions already stored are replayed.
+        for cond_name in args.light_conditions:
+            backend      = _CONDITION_BACKEND[cond_name]
+            render_pairs = _CONDITION_RENDER_PAIRS[cond_name]
 
-            set_shadow(pt_lights, True)
-            pt_shadow_data = bproc.renderer.render(load_keys={"colors"})
-            save_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.png"))
-            save_srgb_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}_srgb.png"))
-            save_exr(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.exr"))
-
-            set_shadow(pt_lights, False)
-            pt_noshadow_data = bproc.renderer.render(load_keys={"colors"})
-            save_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.png"))
-            save_srgb_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}_srgb.png"))
-            save_exr(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.exr"))
-
-            for l in pt_lights:
-                l.delete()
-            print(f"view {view_idx} point[{light_idx}]: re-rendered "
-                  f"(stored brightness={pt_entry['brightness']:.3f})")
+            if cond_name in _setup:
+                # ── Replay stored entries ──────────────────────────────────
+                for light_idx, entry in enumerate(_setup[cond_name]):
+                    is_world = bool(entry["light_spec"]) and \
+                        entry["light_spec"][0].get("type") == "ENV"
+                    old_world = tmp_world = tmp_img = None
+                    lights = []
+                    if is_world:
+                        old_world, tmp_world, tmp_img = _apply_world_spec(
+                            entry["light_spec"][0]
+                        )
+                    else:
+                        lights = create_lights_from_spec(entry["light_spec"])
+                    bproc.renderer.set_max_amount_of_samples(args.samples)
+                    for stem_tpl, use_shadow in render_pairs:
+                        stem = stem_tpl.format(i=light_idx)
+                        if not is_world:
+                            set_shadow(lights, use_shadow)
+                        data = bproc.renderer.render(load_keys={"colors"})
+                        _save_beauty(data["colors"][0], view_dir, stem)
+                    if is_world:
+                        _restore_world_spec(old_world, tmp_world, tmp_img)
+                    else:
+                        for l in lights:
+                            l.delete()
+                    print(f"view {view_idx} {cond_name}[{light_idx}]: re-rendered "
+                          f"(stored brightness={entry['brightness']:.3f})")
+            else:
+                # ── Generate fresh setups for this condition ───────────────
+                shadow_prev = _CONDITION_SHADOW_PREVIEW[cond_name]
+                for light_idx in range(args.num_light_setups):
+                    old_world = tmp_world = tmp_img = None
+                    lights = []
+                    if backend == "world":
+                        env_path = env_map_paths[light_idx % len(env_map_paths)]
+                        spec = [{"type": "ENV", "path": env_path,
+                                 "strength": args.env_map_strength}]
+                        old_world, tmp_world, tmp_img = _apply_world_spec(spec[0])
+                        bproc.renderer.set_max_amount_of_samples(args.preview_samples)
+                        preview = bproc.renderer.render(load_keys={"colors"})
+                        brightness = average_brightness(preview["colors"][0])
+                        accepted, attempts = True, 1
+                    else:
+                        sampler = cond_samplers[cond_name]
+                        spec, brightness, attempts, accepted, lights = \
+                            render_light_condition(sampler, shadow_prev)
+                    bproc.renderer.set_max_amount_of_samples(args.samples)
+                    for stem_tpl, use_shadow in render_pairs:
+                        stem = stem_tpl.format(i=light_idx)
+                        if backend == "light":
+                            set_shadow(lights, use_shadow)
+                        data = bproc.renderer.render(load_keys={"colors"})
+                        _save_beauty(data["colors"][0], view_dir, stem)
+                    if backend == "world":
+                        _restore_world_spec(old_world, tmp_world, tmp_img)
+                    else:
+                        for l in lights:
+                            l.delete()
+                    status = "accepted" if accepted else f"gave up after {attempts} attempt(s)"
+                    print(f"view {view_idx} {cond_name}[{light_idx}]: "
+                          f"brightness={brightness:.3f} ({status}) [new]")
 
         print(f"View {view_idx} done -> {view_dir}")
 
@@ -858,69 +1061,77 @@ else:
             }
         }
 
-        # ── SUN lights, no shadows ────────────────────────────────────────
-        sun_results = []
-        for light_idx in range(args.num_light_setups):
-            sun_spec, sun_brightness, sun_attempts, sun_accepted, sun_lights = \
-                render_light_condition(sample_sun_light_setup, use_shadow_for_preview=False)
-            set_shadow(sun_lights, False)
-            bproc.renderer.set_max_amount_of_samples(args.samples)
-            sun_data = bproc.renderer.render(load_keys={"colors"})
-            save_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.png"))
-            save_srgb_png(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}_srgb.png"))
-            save_exr(sun_data["colors"][0], os.path.join(view_dir, f"sun_{light_idx}.exr"))
-            for l in sun_lights:
-                l.delete()
-            status = "accepted" if sun_accepted else f"gave up after {sun_attempts} attempt(s)"
-            print(f"view {view_idx} sun[{light_idx}]: brightness={sun_brightness:.3f} ({status})")
-            sun_results.append({
-                "light_spec": sun_spec, "brightness": sun_brightness,
-                "attempts": sun_attempts, "accepted": sun_accepted,
-            })
+        # ── Light conditions (generic over args.light_conditions) ────────────
+        assert cam2world_matrix is not None
+        cam_pos = cam2world_matrix[:3, 3].copy()
+        cond_samplers = {
+            "sun":   sample_sun_light_setup,
+            "disk":  lambda: sample_disk_light_setup(cam_pos),
+            "point": sample_point_light_setup,
+        }
 
-        view_manifest["sun"] = sun_results
+        for cond_name in args.light_conditions:
+            backend      = _CONDITION_BACKEND[cond_name]
+            shadow_prev  = _CONDITION_SHADOW_PREVIEW[cond_name]
+            render_pairs = _CONDITION_RENDER_PAIRS[cond_name]
+            cond_results = []
+            for light_idx in range(args.num_light_setups):
+                old_world = tmp_world = tmp_img = None
+                if backend == "world":
+                    env_path = env_map_paths[light_idx % len(env_map_paths)]
+                    spec = [{"type": "ENV", "path": env_path,
+                             "strength": args.env_map_strength}]
+                    old_world, tmp_world, tmp_img = _apply_world_spec(spec[0])
+                    bproc.renderer.set_max_amount_of_samples(args.preview_samples)
+                    preview = bproc.renderer.render(load_keys={"colors"})
+                    brightness = average_brightness(preview["colors"][0])
+                    accepted, attempts = True, 1
+                    lights = []
+                else:
+                    sampler = cond_samplers[cond_name]
+                    spec, brightness, attempts, accepted, lights = \
+                        render_light_condition(sampler, shadow_prev)
 
-        # ── POINT lights — paired shadow / no-shadow ──────────────────────
-        pt_results = []
-        for light_idx in range(args.num_light_setups):
-            pt_spec, pt_brightness, pt_attempts, pt_accepted, pt_lights = \
-                render_light_condition(sample_point_light_setup, use_shadow_for_preview=True)
-            bproc.renderer.set_max_amount_of_samples(args.samples)
+                bproc.renderer.set_max_amount_of_samples(args.samples)
+                for stem_tpl, use_shadow in render_pairs:
+                    stem = stem_tpl.format(i=light_idx)
+                    if backend == "light":
+                        set_shadow(lights, use_shadow)
+                    data = bproc.renderer.render(load_keys={"colors"})
+                    _save_beauty(data["colors"][0], view_dir, stem)
 
-            set_shadow(pt_lights, True)
-            pt_shadow_data = bproc.renderer.render(load_keys={"colors"})
-            save_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.png"))
-            save_srgb_png(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}_srgb.png"))
-            save_exr(pt_shadow_data["colors"][0], os.path.join(view_dir, f"point_shadow_{light_idx}.exr"))
+                if backend == "world":
+                    _restore_world_spec(old_world, tmp_world, tmp_img)
+                else:
+                    for l in lights:
+                        l.delete()
 
-            set_shadow(pt_lights, False)
-            pt_noshadow_data = bproc.renderer.render(load_keys={"colors"})
-            save_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.png"))
-            save_srgb_png(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}_srgb.png"))
-            save_exr(pt_noshadow_data["colors"][0], os.path.join(view_dir, f"point_no_shadow_{light_idx}.exr"))
-
-            for l in pt_lights:
-                l.delete()
-            status = "accepted" if pt_accepted else f"gave up after {pt_attempts} attempt(s)"
-            print(f"view {view_idx} point[{light_idx}]: brightness={pt_brightness:.3f} ({status})")
-            pt_results.append({
-                "light_spec": pt_spec, "brightness": pt_brightness,
-                "attempts": pt_attempts, "accepted": pt_accepted,
-            })
-
-        view_manifest["point"] = pt_results
+                status = "accepted" if accepted else f"gave up after {attempts} attempt(s)"
+                print(f"view {view_idx} {cond_name}[{light_idx}]: brightness={brightness:.3f} ({status})")
+                cond_results.append({
+                    "light_spec": spec, "brightness": brightness,
+                    "attempts": attempts, "accepted": accepted,
+                })
+            view_manifest[cond_name] = cond_results
 
         manifest[str(view_idx)] = view_manifest
 
-        sun_accepted_list = [r for r in sun_results if r["accepted"]]
-        pt_accepted_list  = [r for r in pt_results  if r["accepted"]]
-        if sun_accepted_list and pt_accepted_list and cam2world_matrix is not None:
+        # Record view only when every requested condition has ≥1 accepted setup.
+        cond_accepted: dict = {}
+        all_have_accepted = True
+        for cond_name in args.light_conditions:
+            accepted_list = [r for r in view_manifest.get(cond_name, []) if r["accepted"]]
+            if accepted_list:
+                cond_accepted[cond_name] = [
+                    {"light_spec": r["light_spec"], "brightness": r["brightness"]}
+                    for r in accepted_list
+                ]
+            else:
+                all_have_accepted = False
+        if all_have_accepted and cam2world_matrix is not None:
             accepted_setups[str(view_idx)] = {
                 "cam2world": cam2world_matrix.tolist(),
-                "sun":   [{"light_spec": r["light_spec"], "brightness": r["brightness"]}
-                          for r in sun_accepted_list],
-                "point": [{"light_spec": r["light_spec"], "brightness": r["brightness"]}
-                          for r in pt_accepted_list],
+                **cond_accepted,
             }
 
         print(f"View {view_idx}/{args.num_camera_poses - 1} done -> {view_dir}")
@@ -933,11 +1144,15 @@ else:
     with open(accepted_path, "w", encoding="utf-8") as f:
         json.dump(accepted_setups, f, indent=2)
 
+    conditions_str = ", ".join(args.light_conditions)
+    renders_per_view = args.num_light_setups * sum(
+        len(_CONDITION_RENDER_PAIRS[c]) for c in args.light_conditions
+    )
     print("\nDone.")
     print(f"{args.num_camera_poses} view(s), {args.num_light_setups} light setups each "
-          f"-> {args.num_camera_poses * args.num_light_setups * 3} total renderings")
+          f"x {len(args.light_conditions)} condition(s) [{conditions_str}] "
+          f"-> {args.num_camera_poses * renders_per_view} total renderings")
     print(f"Accepted setups: {len(accepted_setups)}/{args.num_camera_poses} views "
           f"-> {accepted_path}")
-    print(f"Output: {scene_dir}/<cam_nr>/{{albedo,normals,roughness,metallic,"
-          f"sun,point_shadow,point_no_shadow}}_*.{{png,exr}}")
+    print(f"Output: {scene_dir}/<cam_nr>/{{albedo,normals,roughness,metallic,...}}.{{png,exr}}")
     print("Light condition manifest:", manifest_path)
