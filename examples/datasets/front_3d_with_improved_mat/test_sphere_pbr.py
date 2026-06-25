@@ -45,6 +45,16 @@ parser.add_argument("--env_map", nargs="?", const=_DEFAULT_ENV_MAP, default=None
                          "Pass without a value to use the default sh_env_map_000.png, "
                          "or supply an explicit path.")
 parser.add_argument("--env_map_strength", type=float, default=2.0)
+parser.add_argument("--cam_azimuth",   type=float, default=-90.0,
+                    help="Camera azimuth in degrees (default -90 = the legacy (0,-3,0) pose).")
+parser.add_argument("--cam_elevation", type=float, default=0.0,
+                    help="Camera elevation in degrees above the XY plane.")
+parser.add_argument("--cam_dist",      type=float, default=3.0,
+                    help="Camera distance from origin.")
+parser.add_argument("--cam_roll",      type=float, default=0.0,
+                    help="Camera roll in degrees about its forward axis. The key knob for "
+                         "exercising the world->camera transform: a non-zero roll makes the "
+                         "rotation non-axis-aligned, so a transpose/handedness bug shows up.")
 args = parser.parse_args()
 output_dir = os.path.abspath(args.output_dir)
 os.makedirs(output_dir, exist_ok=True)
@@ -110,17 +120,40 @@ for input_name in ("Roughness", "Metallic"):
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 # Camera at (0, -3, 0) looking at origin — forward = +Y world, right = +X world
-cam_pos  = np.array([0.0, -3.0, 0.0])
-target   = np.array([0.0,  0.0, 0.0])
-world_up = np.array([0.0,  0.0, 1.0])
-fwd   = target - cam_pos;  fwd   /= np.linalg.norm(fwd)
-right = np.cross(fwd, world_up);  right /= np.linalg.norm(right)
-up    = np.cross(right, fwd);     up    /= np.linalg.norm(up)
-R = np.stack([right, up, -fwd], axis=1)
-cam2world = np.eye(4, dtype=np.float32)
-cam2world[:3, :3] = R
-cam2world[:3,  3] = cam_pos
+
+# ── Camera ────────────────────────────────────────────────────────────────────
+# Camera-locked env map => the highlight MUST land in the same screen position
+# for every pose below. Roll is the discriminating test: at (0,-3,0) the world->cam
+# rotation is nearly a permutation and hides transpose/handedness errors; a rolled
+# or tilted pose does not.
+def look_at_pose(cam_pos, target, world_up, roll_deg=0.0):
+    fwd   = target - cam_pos; fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, world_up); right /= np.linalg.norm(right)
+    up    = np.cross(right, fwd);    up    /= np.linalg.norm(up)
+    if roll_deg != 0.0:
+        r = math.radians(roll_deg)
+        cr, sr = math.cos(r), math.sin(r)
+        right, up = cr * right + sr * up, -sr * right + cr * up
+    R = np.stack([right, up, -fwd], axis=1)
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, :3] = R
+    c2w[:3,  3] = cam_pos
+    return c2w
+
+az = math.radians(args.cam_azimuth)
+el = math.radians(args.cam_elevation)
+cam_pos = args.cam_dist * np.array([
+    math.cos(el) * math.cos(az),
+    math.cos(el) * math.sin(az),
+    math.sin(el),
+], dtype=np.float32)
+target   = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+cam2world = look_at_pose(cam_pos, target, world_up, roll_deg=args.cam_roll)
 bproc.camera.add_camera_pose(cam2world)
+print(f"Camera: az={args.cam_azimuth} el={args.cam_elevation} "
+      f"dist={args.cam_dist} roll={args.cam_roll}  pos={cam_pos.tolist()}")
 
 # ── Lighting ─────────────────────────────────────────────────────────────────
 if args.env_map:
@@ -131,6 +164,7 @@ if args.env_map:
     wn.clear()
 
     env_img = bpy.data.images.load(os.path.abspath(args.env_map))
+    env_img.colorspace_settings.name = "Non-Color"   # treat PNG values as linear, not sRGB
     tex = wn.new("ShaderNodeTexEnvironment")
     tex.image = env_img
 

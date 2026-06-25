@@ -258,6 +258,10 @@ if args.seed is not None:
 bproc.init()
 bproc.renderer.set_max_amount_of_samples(args.samples)
 
+bpy.context.scene.cycles.max_bounces = 0          # direct only
+bpy.context.scene.cycles.diffuse_bounces = 0
+bpy.context.scene.cycles.glossy_bounces = 0
+
 # Disable all display/view transforms so every output (G-buffers AND beauty
 # renders) is saved in raw linear light with no tonemapping or gamma applied.
 bpy.context.scene.view_settings.view_transform = "Raw"
@@ -855,34 +859,40 @@ def _apply_world_spec(spec):
     nodes.clear()
 
     img = bpy.data.images.load(spec["path"])
+    img.colorspace_settings.name = "Non-Color"   # treat PNG values as linear, not sRGB
     tex = nodes.new("ShaderNodeTexEnvironment")
     tex.image = img
 
-    # Transform incoming ray direction from world space → camera space so the
-    # env map is locked to the camera's view rather than to world orientation.
-    sep  = nodes.new("ShaderNodeSeparateXYZ")
-    negz = nodes.new("ShaderNodeMath"); negz.operation = "MULTIPLY"; negz.inputs[1].default_value = -1.0
-    comb = nodes.new("ShaderNodeCombineXYZ")    
-    
+    # World->camera so the env is camera-locked, then permute camera-space
+    # (x, y, z) -> (-x, -z, -y) to match the torch EnvMap convention
+    # (pole = Y, azimuth = atan2(z, x)). Validated on sphere + rolled camera.
     geom      = nodes.new("ShaderNodeNewGeometry")
     vec_xform = nodes.new("ShaderNodeVectorTransform")
     vec_xform.vector_type  = "VECTOR"
     vec_xform.convert_from = "WORLD"
     vec_xform.convert_to   = "CAMERA"
 
+    sep  = nodes.new("ShaderNodeSeparateXYZ")
+    negx = nodes.new("ShaderNodeMath"); negx.operation = "MULTIPLY"; negx.inputs[1].default_value = -1.0
+    negz = nodes.new("ShaderNodeMath"); negz.operation = "MULTIPLY"; negz.inputs[1].default_value = -1.0
+    negy = nodes.new("ShaderNodeMath"); negy.operation = "MULTIPLY"; negy.inputs[1].default_value = -1.0
+    comb = nodes.new("ShaderNodeCombineXYZ")
+
     bg = nodes.new("ShaderNodeBackground")
     bg.inputs["Strength"].default_value = spec["strength"]
-    out = nodes.new("ShaderNodeOutputWorld")    
+    out = nodes.new("ShaderNodeOutputWorld")
 
     links.new(geom.outputs["Incoming"],    vec_xform.inputs["Vector"])
     links.new(vec_xform.outputs["Vector"], sep.inputs["Vector"])
-    links.new(sep.outputs["Z"], negz.inputs[0])
-    links.new(sep.outputs["X"], comb.inputs["X"])   # X' =  x
-    links.new(negz.outputs["Value"], comb.inputs["Y"])  # Y' = -z
-    links.new(sep.outputs["Y"], comb.inputs["Z"])   # Z' =  y
-    links.new(comb.outputs["Vector"], tex.inputs["Vector"])
-    links.new(tex.outputs["Color"],   bg.inputs["Color"])
-    links.new(bg.outputs["Background"], out.inputs["Surface"])
+    links.new(sep.outputs["X"],            negx.inputs[0])
+    links.new(sep.outputs["Z"],            negz.inputs[0])
+    links.new(sep.outputs["Y"],            negy.inputs[0])
+    links.new(negx.outputs["Value"],       comb.inputs["X"])   # X' = -x
+    links.new(negz.outputs["Value"],       comb.inputs["Y"])   # Y' = -z
+    links.new(negy.outputs["Value"],       comb.inputs["Z"])   # Z' = -y
+    links.new(comb.outputs["Vector"],      tex.inputs["Vector"])
+    links.new(tex.outputs["Color"],        bg.inputs["Color"])
+    links.new(bg.outputs["Background"],    out.inputs["Surface"])
 
     world.cycles_visibility.shadow = False
     bpy.context.scene.world = world
@@ -1046,13 +1056,11 @@ if args.accepted_setups:
                     lights = []
                     if backend == "world":
                         env_path = env_map_paths[light_idx % len(env_map_paths)]
-                        spec = [{"type": "ENV", "path": env_path,
-                                 "strength": args.env_map_strength}]
+                        spec = [{"type": "ENV", "path": env_path, "strength": args.env_map_strength}]
                         old_world, tmp_world, tmp_img = _apply_world_spec(spec[0])
-                        bproc.renderer.set_max_amount_of_samples(args.preview_samples)
-                        preview = bproc.renderer.render(load_keys={"colors"})
-                        brightness = average_brightness(preview["colors"][0])
+                        brightness = float("nan")        # not used for env; kept for manifest shape
                         accepted, attempts = True, 1
+                        lights = []
                     else:
                         sampler = cond_samplers[cond_name]
                         spec, brightness, attempts, accepted, lights = \
