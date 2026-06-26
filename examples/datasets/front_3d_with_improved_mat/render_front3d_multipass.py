@@ -192,7 +192,7 @@ parser.add_argument("--env_map_dir",
                      help="Folder containing env map PNGs named sh_env_map_NNN.png, used when "
                           "'env' is listed in --light_conditions. Files are cycled in sorted "
                           "order across the num_light_setups slots.")
-parser.add_argument("--env_map_strength", type=float, default=1.0,
+parser.add_argument("--env_map_strength", type=float, default=2.0,
                      help="Constant background strength applied to every env map. Default: 1.0.")
 parser.add_argument("--accepted_setups", default=None,
                      help="Path to an accepted_setups.json produced by a previous run of this "
@@ -804,6 +804,11 @@ def save_exr(arr, path):
     else:
         rgba = arr.copy()
     img = bpy.data.images.new(os.path.basename(path), width=W, height=H, float_buffer=True)
+    # New float images default to a "Linear Rec.709" colorspace; on save() Blender
+    # then applies that space's OETF and writes sRGB-encoded floats into the EXR
+    # (verified: a linear 0.5 came back as 0.735). "Non-Color" disables any
+    # transform so the raw linear pixels are stored as-is.
+    img.colorspace_settings.name = "Non-Color"
     img.pixels.foreach_set(rgba[::-1].reshape(-1).tolist())
     img.file_format = "OPEN_EXR"
     img.filepath_raw = path

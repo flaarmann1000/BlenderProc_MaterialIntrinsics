@@ -55,6 +55,9 @@ parser.add_argument("--cam_roll",      type=float, default=0.0,
                     help="Camera roll in degrees about its forward axis. The key knob for "
                          "exercising the world->camera transform: a non-zero roll makes the "
                          "rotation non-axis-aligned, so a transpose/handedness bug shows up.")
+parser.add_argument("--max_bounces", type=int, default=None,
+                    help="If set, cap Cycles max/diffuse/glossy bounces to this value "
+                         "(use 0 to match render_front3d_multipass.py's direct-only setup).")
 args = parser.parse_args()
 output_dir = os.path.abspath(args.output_dir)
 os.makedirs(output_dir, exist_ok=True)
@@ -66,6 +69,14 @@ bproc.renderer.set_max_amount_of_samples(256)
 # No tonemapping / display transform on any output
 bpy.context.scene.view_settings.view_transform = "Raw"
 bpy.context.scene.render.use_multiview = False
+
+# Match render_front3d_multipass.py's direct-only setup when requested, so the
+# sphere test reproduces the exact light transport of the real dataset.
+if args.max_bounces is not None:
+    bpy.context.scene.cycles.max_bounces     = args.max_bounces
+    bpy.context.scene.cycles.diffuse_bounces = args.max_bounces
+    bpy.context.scene.cycles.glossy_bounces  = args.max_bounces
+    print(f"Cycles bounces capped at {args.max_bounces}")
 
 # ── Material constants ────────────────────────────────────────────────────────
 ALBEDO    = (0.7, 0.3, 0.3)
@@ -245,6 +256,11 @@ def save_exr(arr, path):
     else:
         rgba = arr.copy()
     img = bpy.data.images.new(os.path.basename(path), width=W, height=H, float_buffer=True)
+    # New float images default to a "Linear Rec.709" colorspace; on save() Blender
+    # then applies that space's OETF and writes sRGB-encoded floats into the EXR
+    # (verified: a linear 0.5 came back as 0.735). "Non-Color" disables any
+    # transform so the raw linear pixels are stored as-is.
+    img.colorspace_settings.name = "Non-Color"
     img.pixels.foreach_set(rgba[::-1].reshape(-1).tolist())
     img.file_format  = "OPEN_EXR"
     img.filepath_raw = path
